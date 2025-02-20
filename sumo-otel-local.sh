@@ -22,7 +22,7 @@ function install_dependencies {
 
     if command -v brew &> /dev/null; then
         echo "Installing Dependencies with Homebrew..."
-        brew install jq kubectl helm kind podman
+        brew install --quiet jq kubectl helm kind podman
     elif ! command -v brew &> /dev/null; then
         read -p "Homebrew is not installed. Would you like to install it? [y/n]" yn
         if [[ $yn =~ ^[Yy]$ ]]; then

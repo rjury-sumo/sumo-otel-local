@@ -86,23 +86,18 @@ function install {
             if [[ $yn =~ ^[Yy]$ ]]; then
                 echo "Using existing Podman machine..."
             else
-                echo "Creating a new Podman machine..."   
-                DEFAULT_NAME="sumo"
-                DEFAULT_MEMORY=18432
-                read -p "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " MEMORY
-                read -p "Name of the Podman machine [default=${DEFAULT_NAME}]: " NAME
-                : ${MEMORY:=${DEFAULT_MEMORY}}
-                : ${NAME:=${DEFAULT_NAME}}
-                podman machine init --memory ${MEMORY} ${NAME}
-                podman machine start ${NAME}
+                new_podman
+            fi
+        elif podman machine list | grep -q "stopped" ; then
+            read -p "Podman Machine is stopped. Would you like to start it? [y/n]" yn
+            if [[ $yn =~ ^[Yy]$ ]]; then
+                echo "Starting existing Podman machine..."
+                podman machine start
+            else
+                new_podman
             fi
         else
-            echo "Initialising a default Podman machine..."
-            DEFAULT_MEMORY=18432
-            read -p "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " MEMORY
-            : ${MEMORY:=${DEFAULT_MEMORY}}
-            podman machine init --memory ${MEMORY}
-            podman machine start
+            new_podman
         fi
     else
         read -p "Podman is not installed. Are you using Docker Desktop? [y/n]" yn
@@ -190,8 +185,6 @@ function uninstall {
     read -p "Are you sure you want to continue? [y/n]" yn
     if [[ $yn =~ ^[Yy]$ ]]; then
         DEFAULT_CLUSTER_NAME="sumo"
-        echo "Listing Kind Clusters on this machine" 
-        echo $(kind get clusters)
         read -p "Type the name of the cluster to continue. Type [exit] to cancel: " CLUSTER_NAME
         : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
         if [[ $CLUSTER_NAME == "exit" ]]; then
@@ -213,6 +206,19 @@ function uninstall {
 function version {
     RELEASE=$(curl -L -s https://api.github.com/repos/bradtho/sumo-otel-local/releases/latest | jq -r .tag_name)
     echo "sumo-otel-local ${RELEASE}"
+}
+
+## Helper Functions
+function new_podman {
+    echo "Creating a new Podman machine..."   
+    DEFAULT_NAME="sumo"
+    DEFAULT_MEMORY=18432
+    read -p "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " MEMORY
+    read -p "Name of the Podman machine [default=${DEFAULT_NAME}]: " NAME
+    : ${MEMORY:=${DEFAULT_MEMORY}}
+    : ${NAME:=${DEFAULT_NAME}}
+    podman machine init --memory ${MEMORY} ${NAME}
+    podman machine start ${NAME}
 }
 
 function cleanup {

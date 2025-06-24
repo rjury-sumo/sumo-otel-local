@@ -5,6 +5,7 @@
 1. [Change the Metrics Scrape Interval](#metrics_intervalyaml)
 2. [Add Persistent Volume Claim Metrics](#metrics_pvcyaml)
 3. [Skip Installation](#no_installyaml)
+4. [Delete Finalisers](#finalisers)
 
 ## metrics_interval.yaml
 
@@ -59,4 +60,12 @@ To extract the values of each endpoint e.g. for "endpoint-logs"
 
 ```bash
 kubectl get --namespace sumologic secrets/sumologic --template='{{ index .data "endpoint-logs" }}' | base64 -d
+```
+
+## Finalisers
+
+In the event that a resource is stuck because of a finaliser
+
+```bash
+kubectl patch crd/opentelemetrycollectors.opentelemetry.io -p '{"metadata": {"finalizers":[] '--type=merge}}
 ```

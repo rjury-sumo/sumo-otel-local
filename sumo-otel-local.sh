@@ -146,7 +146,7 @@ function install {
     echo ""
 
     DEFAULT_HELM_VALUES="values.yaml"
-    echo "Additional example values can in the examples folder. When prompted, please provide the path to the values.yaml file. e.g. examples/values.yaml"
+    echo "Additional example values can be found in the examples folder. When prompted, please provide the path to the values.yaml file. e.g. examples/values.yaml"
     read -p "Name and Location of the Helm Values file. [default=values.yaml]: " HELM_VALUES
     : ${HELM_VALUES:=${DEFAULT_HELM_VALUES}}
 

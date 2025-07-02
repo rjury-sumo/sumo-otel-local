@@ -7,9 +7,12 @@ function help {
     echo "Usage: $0 [options]"
     echo "Options:"
     echo "  -h, --help      Display this help message."
-    echo "  -i, --install   Install the dependencies and setup the environment."
+    echo "  -i, --install   Install the dependencies and setup the Sumo Operator."
+    echo "  -n, --init      Install dependencies without setting up the Sumo Operator."
+    echo "  -m, --helm      Install Sumo Operator onto existing cluster."
     echo "  -o, --output    Output the rendered Kubernetes manifest YAML file."
-    echo "  -u, --uninstall Uninstall the dependencies and cleanup the environment."
+    echo "  -p, --purge     Uninstall the Cluster and Podman Machine."
+    echo "  -u, --uninstall Uninstall the Cluster only."
     echo "  -v, --version   Display the version of the script."
 }
 
@@ -77,28 +80,11 @@ function install_dependencies {
     fi
 }
 
-function install {
+function init_cluster {
     # Initialise and Start Podman
     if command -v podman &> /dev/null; then
         echo "Podman is installed..."
-        if podman machine list | grep -q "running" ; then
-            read -p "Podman Machine already running. Would you like to use it? [y/n]" yn
-            if [[ $yn =~ ^[Yy]$ ]]; then
-                echo "Using existing Podman machine..."
-            else
-                new_podman
-            fi
-        elif podman machine list | grep -q "stopped" ; then
-            read -p "Podman Machine is stopped. Would you like to start it? [y/n]" yn
-            if [[ $yn =~ ^[Yy]$ ]]; then
-                echo "Starting existing Podman machine..."
-                podman machine start
-            else
-                new_podman
-            fi
-        else
-            new_podman
-        fi
+        use_existing_podman
     else
         read -p "Podman is not installed. Are you using Docker Desktop? [y/n]" yn
         if [[ $yn =~ ^[Yy]$ ]]; then
@@ -114,6 +100,9 @@ function install {
     read -p "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " CLUSTER_NAME
     : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
     kind create cluster --name ${CLUSTER_NAME} --config kind-config.yaml
+}
+
+function install_sumo {    
 
     # Install Sumo Logic Operator
 
@@ -181,14 +170,35 @@ function output {
 }
 
 function uninstall {
+    echo "Caution: This will delete the cluster"
+    read -p "Are you sure you want to continue? [y/n]" yn
+    if [[ $yn =~ ^[Yy]$ ]]; then
+        DEFAULT_CLUSTER_NAME="sumo"
+        read -p "Type the name of the cluster (Default: sumo) to continue. Type [exit] to cancel: " CLUSTER_NAME
+        : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
+        if [[ $CLUSTER_NAME == "exit" ]]; then
+            echo "Cancelling and exiting script..."
+            exit 0
+        else
+            echo "Deleting Cluster: ${CLUSTER_NAME}"
+            kind delete cluster --name ${CLUSTER_NAME}
+            echo "Leaving Podman Machine intact"
+        fi
+    else
+        echo "Cancelling and exiting script..."
+        exit 0
+    fi    
+}
+
+function purge {
     echo "Caution: This will delete the cluster and remove the Podman machine!"
     read -p "Are you sure you want to continue? [y/n]" yn
     if [[ $yn =~ ^[Yy]$ ]]; then
         DEFAULT_CLUSTER_NAME="sumo"
-        read -p "Type the name of the cluster to continue. Type [exit] to cancel: " CLUSTER_NAME
+        read -p "Type the name of the cluster (Default: sumo) to continue. Type [exit] to cancel: " CLUSTER_NAME
         : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
         if [[ $CLUSTER_NAME == "exit" ]]; then
-            echo "Exiting..."
+            echo "Cancelling and exiting script..."
             exit 0
         else
             echo "Deleting Cluster: ${CLUSTER_NAME}"
@@ -198,7 +208,7 @@ function uninstall {
             podman machine rm
         fi
     else
-        echo "Exiting..."
+        echo "Cancelling and exiting script..."
         exit 0
     fi
 }
@@ -221,11 +231,141 @@ function new_podman {
     podman machine start ${NAME}
 }
 
+function use_existing_podman {
+    # Minimum requirements
+    MIN_MEM_MB=18432  # in MB
+    MIN_CPU=4
+
+    # Get list of all machines with their specs
+    machines_json=$(podman machine list --format json)
+
+    # Arrays to hold valid machines
+    declare -a valid_names valid_memories valid_cpus
+
+    index=0
+    echo "Checking Podman machines for minimum requirements (Memory ≥ ${MIN_MEM_MB}MB, CPUs ≥ ${MIN_CPU})..."
+
+    # Loop over machines using `jq` length and index
+    machine_count=$(echo "$machines_json" | jq 'length')
+
+    for ((i=0; i<machine_count; i++)); do
+        name=$(echo "$machines_json" | jq -r ".[$i].Name")
+        mem_bytes=$(echo "$machines_json" | jq -r ".[$i].Memory")
+        cpu=$(echo "$machines_json" | jq -r ".[$i].CPUs")
+        
+        #Convert memory from bytes to MB
+        mem_mb=$(awk "BEGIN { printf \"%d\", $mem_bytes / 1024 / 1024 }")
+
+        if [[ "$mem_mb" -ge "$MIN_MEM_MB" && "$cpu" -ge "$MIN_CPU" ]]; then
+            valid_names[$index]="$name"
+            valid_memories[$index]="$mem_mb"
+            valid_cpus[$index]="$cpu"
+            echo "$((index + 1)). $name - Memory: ${mem_mb}MB, CPUs: $cpu"
+            ((index++))
+        fi
+    done
+
+    # Check if any valid machine was found
+    if [[ ${#valid_names[@]} -eq 0 ]]; then
+        echo "No Podman machines meet the minimum requirements (≥ ${MIN_MEM_MB}MB RAM, ≥ ${MIN_CPU} CPUs)."
+        read -p "Would you like to create a new Podman machine with the correct specs? [y/N]: " create_choice
+
+        if [[ "$create_choice" =~ ^[Yy]$ ]]; then
+            # Check if any Podman machine is currently running
+            running_machine=$(echo "$machines_json" | jq -r '.[] | select(.Running == true) | .Name')
+
+            if [[ -n "$running_machine" ]]; then
+                echo "⚠️  Podman machine '$running_machine' is currently running."
+                read -p "Would you like to stop it before creating a new one? [y/N]: " stop_choice
+
+                if [[ "$stop_choice" =~ ^[Yy]$ ]]; then
+                    echo "Stopping '$running_machine'..."
+                    podman machine stop "$running_machine"
+                else
+                    echo "Cannot proceed while another machine is running. Exiting."
+                    exit 1
+                fi
+            fi
+
+            new_podman
+            
+            exit 0
+        else
+            echo "No machine selected and creation declined. Exiting."
+            exit 0
+        fi
+    fi
+
+    # Prompt in a loop until valid input
+    while true; do
+        echo
+        echo "Select a Podman machine to use:"
+        for i in "${!valid_names[@]}"; do
+            display_number=$((i + 1))
+            echo "$display_number. ${valid_names[$i]} - Memory: ${valid_memories[$i]}MB, CPUs: ${valid_cpus[$i]}"
+        done
+
+        create_option=$(( ${#valid_names[@]} + 1 ))
+        exit_option=$(( ${#valid_names[@]} + 2 ))
+
+        echo "$create_option. Create a new Podman machine"
+        echo "$exit_option. None (exit)"
+
+        read -p "Enter your choice [1-$exit_option]: " selection
+
+        # Check input is numeric
+        if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+            echo "Invalid input: please enter a number between 1 and $exit_option."
+            continue
+        fi
+
+        # Handle "Create a new machine"
+        if [[ "$selection" -eq "$create_option" ]]; then
+            new_podman
+            exit 0
+        fi
+
+        # Handle "None"
+        if [[ "$selection" -eq "$exit_option" ]]; then
+            echo "Exiting without selecting a Podman machine."
+            exit 0
+        fi
+
+        # Convert to 0-based index and validate
+        selection_index=$((selection - 1))
+        if [[ "$selection_index" -lt 0 || "$selection_index" -ge ${#valid_names[@]} ]]; then
+            echo "Invalid selection: please enter a number from 1 and $exit_option."
+            continue
+        fi
+
+        # Valid selection
+        chosen_machine="${valid_names[$selection_index]}"
+        machine_running="${valid_statuses[$selection_index]}"
+
+        echo "You selected: $chosen_machine"
+
+        if [[ "$machine_running" != "true" ]]; then
+            echo "Machine '$chosen_machine' is not running."
+            read -p "Would you like to start it now? [y/N]: " start_choice
+            if [[ "$start_choice" =~ ^[Yy]$ ]]; then
+                echo "Starting Podman machine '$chosen_machine'..."
+                podman machine start "$chosen_machine"
+            else
+                echo "Exiting without starting machine."
+                exit 0
+            fi
+        fi
+        # Optional: Activate it
+        # podman machine use "$chosen_machine"
+        break
+    done
+}
+
 function cleanup {
-    echo "Installation Failed: Cleaning up..."
+    echo "Exiting Keyboard Interrupt or Error..."
     uninstall
 }
-trap cleanup EXIT
+trap cleanup ERR
 
 # Parse Arguments
 while [[ $# -gt 0 ]]; do
@@ -237,11 +377,25 @@ while [[ $# -gt 0 ]]; do
             ;;
         -i|--install)
             install_dependencies
-            install
+            init_cluster
+            install_sumo
+            exit 0
+            ;;
+        -n|--init)
+            install_dependencies
+            init_cluster
+            exit 0
+            ;;
+        -m|--helm)
+            install_sumo
             exit 0
             ;;
         -o|--output)
             output
+            exit 0
+            ;;
+        -p|--purge)
+            purge
             exit 0
             ;;
         -u|--uninstall)
@@ -255,7 +409,6 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "Invalid Option: $1"
             help
-            exit 1
             ;;
     esac
     shift

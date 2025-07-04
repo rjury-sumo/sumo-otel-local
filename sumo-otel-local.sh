@@ -139,6 +139,10 @@ function install_sumo {
     read -p "Name and Location of the Helm Values file. [default=values.yaml]: " HELM_VALUES
     : ${HELM_VALUES:=${DEFAULT_HELM_VALUES}}
 
+    DEFAULT_CLUSTER_NAME="sumo"
+    read -p "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " CLUSTER_NAME
+    : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
+
     helm upgrade \
     --install \
     sumologic sumologic/sumologic \
@@ -227,7 +231,24 @@ function new_podman {
     read -p "Name of the Podman machine [default=${DEFAULT_NAME}]: " NAME
     : ${MEMORY:=${DEFAULT_MEMORY}}
     : ${NAME:=${DEFAULT_NAME}}
+
+    echo "Initializing Podman machine '$NAME' with ${MEMORY}MiB RAM..."
     podman machine init --memory ${MEMORY} ${NAME}
+
+    running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
+    if [[ -n "$running_machine" ]]; then
+        echo "Podman machine '$running_machine' is currently running."
+        echo "Only one Podman machine can run at a time"
+        read -p "Would you like to stop it before starting the new one? [y/N]: " stop_choice
+        if [[ "$stop_choice" =~ ^[Yy]$ ]]; then
+            echo "Stopping '$running_machine'..."
+            podman machine stop "$running_machine"
+        else
+            echo "Cannot start new machine while another is running. Exiting."
+            exit 0
+        fi
+    fi    
+    
     podman machine start ${NAME}
 }
 
@@ -252,6 +273,7 @@ function use_existing_podman {
         name=$(echo "$machines_json" | jq -r ".[$i].Name")
         mem_bytes=$(echo "$machines_json" | jq -r ".[$i].Memory")
         cpu=$(echo "$machines_json" | jq -r ".[$i].CPUs")
+        status=$(echo "$machines_json" | jq -r ".[$i].Running")
         
         #Convert memory from bytes to MB
         mem_mb=$(awk "BEGIN { printf \"%d\", $mem_bytes / 1024 / 1024 }")
@@ -260,6 +282,7 @@ function use_existing_podman {
             valid_names[$index]="$name"
             valid_memories[$index]="$mem_mb"
             valid_cpus[$index]="$cpu"
+            valid_statuses[$index]="$status"
             echo "$((index + 1)). $name - Memory: ${mem_mb}MB, CPUs: $cpu"
             ((index++))
         fi

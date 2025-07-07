@@ -17,7 +17,7 @@ This file is used to enable the `kubelet_volume_stats_capacity_bytes` and `kubel
 
 ## no_install.yaml
 
-This file is used to disable the automatic installation of Sumo Logic Observability components and utilise an exsiting Sumo Logic collector.
+This file is used to disable the automatic installation of Sumo Logic Observability components and utilise an existing Sumo Logic collector.
 
 To avoid PODS failing to run because the secret "sumologic" is not available, Create the secret manually to fix the setup POD failing to run.
 

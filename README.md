@@ -26,11 +26,14 @@ For additional options use the `help` function
 ./sumo-otel-local.sh -h
 Usage: ./sumo-otel-local.sh [options]
 Options:
-  -h, --help      Display this help message.
-  -i, --install   Install the dependencies and setup the environment.
-  -o, --output    Output the rendered Kubernetes manifest YAML file.
-  -u, --uninstall Uninstall the dependencies and cleanup the environment.
-  -v, --version   Display the version of the script. 
+    -h, --help      Display this help message.
+    -i, --install   Install the dependencies and setup the Sumo Operator.
+    -n, --init      Install dependencies without setting up the Sumo Operator.
+    -m, --helm      Install Sumo Operator onto existing cluster.
+    -o, --output    Output the rendered Kubernetes manifest YAML file.
+    -p, --purge     Uninstall the Cluster and Podman Machine.
+    -u, --uninstall Uninstall the Cluster only.
+    -v, --version   Display the version of the script.
 ```
 
 ## Advanced (Sandpit)

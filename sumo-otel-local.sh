@@ -81,6 +81,8 @@ function install_dependencies {
 }
 
 function init_cluster {
+    DEFAULT_CLUSTER_NAME="sumo"
+
     # Initialise and Start Podman
     if command -v podman &> /dev/null; then
         echo "Podman is installed..."
@@ -95,11 +97,15 @@ function init_cluster {
         fi
     fi
 
-    # Create a cluster
-    DEFAULT_CLUSTER_NAME="sumo"
-    read -p "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " CLUSTER_NAME
-    : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
-    kind create cluster --name ${CLUSTER_NAME} --config kind-config.yaml
+    read -p "KinD will install the latest Kubernetes version is this OK? [y/n]" yn
+    if [[ $yn =~ ^[Yy]$ ]]; then
+        # Create a cluster
+        read -p "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " CLUSTER_NAME
+        : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
+        kind create cluster --name ${CLUSTER_NAME} --config kind-config.yaml
+    else
+        echo "Please select the version of Kubernetes you would like to run."
+    
 }
 
 function install_sumo {    

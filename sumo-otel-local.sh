@@ -105,7 +105,7 @@ function init_cluster {
         kind create cluster --name ${CLUSTER_NAME} --config kind-config.yaml
     else
         echo "Please select the version of Kubernetes you would like to run."
-    
+    fi   
 }
 
 function install_sumo {    
@@ -201,7 +201,8 @@ function uninstall {
 }
 
 function purge {
-    echo "Caution: This will delete the cluster and remove the Podman machine!"
+    running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
+    echo "Caution: This will delete the cluster and remove the - ${running_machine} - Podman machine!"
     read -p "Are you sure you want to continue? [y/n]" yn
     if [[ $yn =~ ^[Yy]$ ]]; then
         DEFAULT_CLUSTER_NAME="sumo"
@@ -213,9 +214,9 @@ function purge {
         else
             echo "Deleting Cluster: ${CLUSTER_NAME}"
             kind delete cluster --name ${CLUSTER_NAME}
-            echo "Stopping and Removing Podman Machine..."
-            podman machine stop
-            podman machine rm
+            echo "Stopping and Removing the - ${running_machine} - Podman Machine..."
+            podman machine stop ${running_machine}
+            podman machine rm ${running_machine}
         fi
     else
         echo "Cancelling and exiting script..."

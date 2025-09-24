@@ -5,7 +5,7 @@
 1. [Change the Metrics Scrape Interval](#metrics_intervalyaml)
 2. [Add Persistent Volume Claim Metrics](#metrics_pvcyaml)
 3. [Skip Installation](#no_installyaml)
-4. [Authenticated Metrics Endpoints](#metrics_auth.yaml)
+4. [Authenticated Metrics Endpoints](#metrics_authyaml)
 5. [Delete Finalisers](#finalisers)
 
 ## metrics_interval.yaml

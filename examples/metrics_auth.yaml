@@ -1,0 +1,31 @@
+sumologic:
+  clusterName: kind-sumo
+  setupEnabled: true
+  cleanupEnabled: true
+  setup:
+    dashboards:
+      enabled: false
+    monitors:
+      enabled: false
+  metrics: 
+    collector:
+      otelcol:
+        scrapeInterval: 30s
+    additionalServiceMonitors:
+      - name: no-auth-metrics-monitor
+        endpoints:
+          - port: metrics1
+            path: /metrics1
+          - port: metrics2
+            path: /metrics2
+        namespaceSelector:
+          matchNames:
+            - default
+        selector:
+          matchLabels:
+            app: no-auth-metrics-service   
+kube-prometheus-stack:
+  prometheusOperator:
+    enabled: true
+  prometheus:
+    enabled: true

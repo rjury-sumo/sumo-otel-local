@@ -5,7 +5,8 @@
 1. [Change the Metrics Scrape Interval](#metrics_intervalyaml)
 2. [Add Persistent Volume Claim Metrics](#metrics_pvcyaml)
 3. [Skip Installation](#no_installyaml)
-4. [Delete Finalisers](#finalisers)
+4. [Authenticated Metrics Endpoints](#metrics_auth.yaml)
+5. [Delete Finalisers](#finalisers)
 
 ## metrics_interval.yaml
 
@@ -44,6 +45,32 @@ PODS should now be running and ingesting data to a pre-existed collector within 
 
 This assumes "Hosted collectors" and Sources were previously created in Sumo Logic either Manually, via API or Terraform.
 
+## metrics_auth.yaml
+
+To make use of this file you will first need to deploy the kubernetes manifest found in [../manifests/metrics_auth](../manifests/metrics_auth.yaml)
+
+```bash
+kubectl apply -f ../manifests/metrics_auth.yaml
+```
+
+This will install the following resources:
+
+- Deployment of a Python App exposing two unauthenticated endpoints.
+- Deployment of a Python App exposing an authenticated endpoint.
+- Namespace for the Authenticated App.
+- Secret for the Authenticated App.
+- Service exposing the unauthenticated enpoints.
+- Service exposing the authenticated enpoint.
+- A ServiceMonitor for Prometheus to scrape the authenticated endpoint.
+
+Code for the Python Apps can be found at [github.com/bradtho/auth-metrics](https://github.com/bradtho/auth-metrics) and
+[github.com/bradtho-no-auth-metrics](https://github.com/bradtho/no-auth-metrics)
+
+Once these Kuberenetes resources have been installed you can then run the Helm Deployment which will install a ServiceMonitor via
+`sumologic.metrics.additionalServiceMonitors` as well as enable the Prometheus Operator and Prometheus. This is required because the
+`sumologic.metrics.additionalServiceMonitors` does not support Authenticated endpoints on multiple endpoints. We need to work around
+this limitation by installing Prometheus and utilising its support for Authenticated endpoints.
+
 ## Notes
 
 When you deploy the Helm Chart as per normal. You can see how it creates all sources and their structure in the console.
@@ -67,5 +94,9 @@ kubectl get --namespace sumologic secrets/sumologic --template='{{ index .data "
 In the event that a resource is stuck because of a finaliser
 
 ```bash
-kubectl patch crd/opentelemetrycollectors.opentelemetry.io -p '{"metadata": {"finalizers":[] '--type=merge}}
+kubectl patch crd/opentelemetrycollectors.opentelemetry.io -p '{"metadata": {"finalizers":[] }}' --type=merge
+```
+
+```bash
+kubectl patch -n sumologic opentelemetrycollector.opentelemetry.io/sumologic-sumologic-metrics -p '{"metadata":{"finalizers":null}}' --type=merge
 ```

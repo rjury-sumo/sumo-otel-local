@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth-metrics
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: auth-metrics
+  name: auth-metrics-secret
+  labels:
+    app: auth-metrics
+type: Opaque
+data:
+  username: cHJvbWV0aGV1cw== #prometheus base64 encoded
+  password: Y2hhbmdlbWU= #changeme base64 encoded
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: auth-metrics
+  name: auth-metrics-app
+  labels:
+    app: auth-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-metrics
+  template:
+    metadata:
+      labels:
+        app: auth-metrics
+    spec:
+      containers:
+        - name: auth-metrics-app
+          image: bradtho/auth-metrics-app:latest   # <-- replace with your image
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          ports:
+            - containerPort: 8080
+          env:
+            - name: METRICS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: auth-metrics-secret
+                  key: username
+            - name: METRICS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: auth-metrics-secret
+                  key: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: auth-metrics
+  name: auth-metrics-service
+  labels:
+    app: auth-metrics-service
+spec:
+  selector:
+    app: auth-metrics
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 8080       # Service port
+      targetPort: 8080 # Container port
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: no-auth-metrics-app
+  labels:
+    app: no-auth-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: no-auth-metrics
+  template:
+    metadata:
+      labels:
+        app: no-auth-metrics
+      # annotations:
+      #   prometheus.io/port: '8080' # Port which metrics should be scraped from
+      #   prometheus.io/scrape: 'true' # Set if metrics should be scraped from this Pod
+      #   prometheus.io/path: '/metrics' # Path which metrics should be scraped from
+    spec:
+      containers:
+        - name: no-auth-metrics-app
+          image: bradtho/no-auth-metrics-app:latest
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8081
+              name: metrics1
+            - containerPort: 8082
+              name: metrics2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: no-auth-metrics-service
+  labels:
+    app: no-auth-metrics-service
+spec:
+  selector:
+    app: no-auth-metrics
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP       
+      targetPort: 8080 
+    - name: metrics1
+      port: 8081
+      protocol: TCP
+      targetPort: 8081
+    - name: metrics2
+      port: 8082
+      protocol: TCP
+      targetPort: 8082
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: sumologic
+  name: auth-metrics-service-monitor
+  labels:
+    app: auth-metrics
+    release: sumologic
+spec:
+  endpoints:
+  - port: metrics
+    interval: 30s
+    basicAuth:
+      password:
+        name: auth-metrics-secret
+        key: password
+      username:
+        name: auth-metrics-secret
+        key: username
+    path: /metrics
+  namespaceSelector:
+    matchNames:
+    - auth-metrics
+  selector:
+    matchLabels:
+      app: auth-metrics-service

@@ -64,7 +64,7 @@ This will install the following resources:
 - A ServiceMonitor for Prometheus to scrape the authenticated endpoint.
 
 Code for the Python Apps can be found at [github.com/bradtho/auth-metrics](https://github.com/bradtho/auth-metrics) and
-[github.com/bradtho-no-auth-metrics](https://github.com/bradtho/no-auth-metrics)
+[github.com/bradtho/no-auth-metrics](https://github.com/bradtho/no-auth-metrics)
 
 Once these Kuberenetes resources have been installed you can then run the Helm Deployment which will install a ServiceMonitor via
 `sumologic.metrics.additionalServiceMonitors` as well as enable the Prometheus Operator and Prometheus. This is required because the

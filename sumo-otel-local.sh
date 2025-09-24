@@ -439,6 +439,7 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "Invalid Option: $1"
             help
+            exit 1
             ;;
     esac
     shift

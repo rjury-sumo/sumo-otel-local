@@ -169,7 +169,7 @@ function output {
 
     read -p "Name and Location of the Helm Values file. [default=values.yaml]: " HELM_VALUES
     : ${HELM_VALUES:=${DEFAULT_HELM_VALUES}}
-    read -p "Name and Location of the rendered Kuberenetes Manifest YAML file. [default=sumologic-rendered.yaml]: " K8S_YAML
+    read -p "Name and Location of the rendered Kubernetes Manifest YAML file. [default=sumologic-rendered.yaml]: " K8S_YAML
     : ${K8S_YAML:=${DEFAULT_K8S_YAML}}   
  
     helm template \

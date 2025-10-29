@@ -149,6 +149,14 @@ function install_sumo {
     read -p "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " CLUSTER_NAME
     : ${CLUSTER_NAME:=${DEFAULT_CLUSTER_NAME}}
 
+    read -p "Do you want to check for Helm Repo Updates? [y/n]" yn
+    if [[ $yn =~ ^[Yy]$ ]]; then
+        helm repo add sumologic https://sumologic.github.io/sumologic-kubernetes-collection
+        helm repo update sumologic
+    else
+        echo "Skipping Update."
+    fi
+
     helm upgrade \
     --install \
     sumologic sumologic/sumologic \

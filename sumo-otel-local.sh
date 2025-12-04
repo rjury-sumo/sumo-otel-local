@@ -197,20 +197,6 @@ function uninstall {
 }
 
 function purge {
-    if ! ACCESS_ID=$(security find-generic-password -s sumologic_access_id -w 2>/dev/null); then
-        echo "Sumo Logic Access ID not found in Keychain continuing to purge."
-    else
-        echo "Removing 'sumologic_access_id' from Keychain."
-        security delete-generic-password -s "sumologic_access_id"
-    fi
-
-    if ! ACCESS_KEY=$(security find-generic-password -s sumologic_access_key -w 2>/dev/null); then
-        echo "Sumo Logic Access Key not found in Keychain continuing to purge."
-    else
-        echo "Removing 'sumologic_access_key' from Keychain."
-        security delete-generic-password -s "sumologic_access_key"
-    fi
-
     running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
     echo "Caution: This will delete the cluster and remove the - ${running_machine} - Podman machine!"
     read -p "Are you sure you want to continue? [y/n]" yn
@@ -231,6 +217,20 @@ function purge {
     else
         echo "Cancelling and exiting script..."
         exit 0
+    fi
+
+    if ! ACCESS_ID=$(security find-generic-password -s sumologic_access_id -w 2>/dev/null); then
+        echo "Sumo Logic Access ID not found in Keychain continuing to purge."
+    else
+        echo "Removing 'sumologic_access_id' from Keychain."
+        security delete-generic-password -s "sumologic_access_id"
+    fi
+
+    if ! ACCESS_KEY=$(security find-generic-password -s sumologic_access_key -w 2>/dev/null); then
+        echo "Sumo Logic Access Key not found in Keychain continuing to purge."
+    else
+        echo "Removing 'sumologic_access_key' from Keychain."
+        security delete-generic-password -s "sumologic_access_key"
     fi
 }
 

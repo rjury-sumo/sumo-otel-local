@@ -112,33 +112,21 @@ function install_sumo {
 
     # Install Sumo Logic Operator
 
-    ACCESS_ID=""
-    ACCESS_ID_VAR="Enter your SumoLogic Access ID: "            # to take password character wise
-    while IFS= read -p "$ACCESS_ID_VAR" -r -s -n 1 letter
-    do
-        if [[ $letter == $'\0' ]]                               #  if enter is pressed, exit the loop
-        then
-            break
-        fi
-        
-        ACCESS_ID+="$letter"                                    # store the letter in ACCESS_ID, use pass+="$letter" for more concise and readable.
-        ACCESS_ID_VAR="*"                                       # in place of password the asterisk (*) will be printed
-    done
-    echo ""
+    ## Securely handle ACCESS_ID and ACCESS_KEY
 
-    ACCESS_KEY=""
-    ACCESS_KEY_VAR="Enter your SumoLogic Access Key: "           # to take password character wise
-    while IFS= read -p "$ACCESS_KEY_VAR" -r -s -n 1 letter
-    do
-        if [[ $letter == $'\0' ]]                               #  if enter is pressed, exit the loop
-        then
-            break
-        fi
-        
-        ACCESS_KEY+="$letter"                                   # store the letter in ACCESS_KEY, use VAR+="$letter" for more concise and readable.
-        ACCESS_KEY_VAR="*"                                      # in place of password the asterisk (*) will be printed
-    done
-    echo ""
+    if ! ACCESS_ID=$(security find-generic-password -s sumologic_access_id -w 2>/dev/null); then
+        echo "Sumo Logic Access ID not found in Keychain"
+        read -s -p "Enter Sumo Logic Access ID: " ACCESS_ID
+        echo ""
+        security add-generic-password -a "$USER" -s "sumologic_access_id" -w "$ACCESS_ID"
+    fi
+
+    if ! ACCESS_KEY=$(security find-generic-password -s sumologic_access_key -w 2>/dev/null); then
+        echo "Sumo Logic Access Key not found in Keychain"
+        read -s -p "Enter Sumo Logic Access Key: " ACCESS_KEY
+        echo ""
+        security add-generic-password -a "$USER" -s "sumologic_access_key" -w "$ACCESS_KEY"
+    fi
 
     DEFAULT_HELM_VALUES="values.yaml"
     echo "Additional example values can be found in the examples folder. When prompted, please provide the path to the values.yaml file. e.g. examples/values.yaml"
@@ -209,6 +197,20 @@ function uninstall {
 }
 
 function purge {
+    if ! ACCESS_ID=$(security find-generic-password -s sumologic_access_id -w 2>/dev/null); then
+        echo "Sumo Logic Access ID not found in Keychain continuing to purge."
+    else
+        echo "Removing 'sumologic_access_id' from Keychain."
+        security delete-generic-password -s "sumologic_access_id"
+    fi
+
+    if ! ACCESS_KEY=$(security find-generic-password -s sumologic_access_key -w 2>/dev/null); then
+        echo "Sumo Logic Access Key not found in Keychain continuing to purge."
+    else
+        echo "Removing 'sumologic_access_key' from Keychain."
+        security delete-generic-password -s "sumologic_access_key"
+    fi
+
     running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
     echo "Caution: This will delete the cluster and remove the - ${running_machine} - Podman machine!"
     read -p "Are you sure you want to continue? [y/n]" yn

@@ -193,7 +193,7 @@ function uninstall {
     else
         echo "Cancelling and exiting script..."
         exit 0
-    fi    
+    fi      
 }
 
 function purge {

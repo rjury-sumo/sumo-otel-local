@@ -27,7 +27,7 @@ while [[ -n "$URL" && "$URL" != "null" ]]; do
     tag_list=$(echo "$response" | jq -r '.results[].name')
     while IFS= read -r tag; do
         TAGS+=("$tag")
-    done <<< "$tag_list"
+    done <<<"$tag_list"
 
     URL="$next_url"
 done
@@ -47,10 +47,10 @@ for tag in "${TAGS[@]}"; do
 done
 
 # Prompt user for selection
-read -p "Enter the number of the tag to use: " selection
+read -rp "Enter the number of the tag to use: " selection
 
 # Validate input
-if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#TAGS[@]} )); then
+if ! [[ "$selection" =~ ^[0-9]+$ ]] || ((selection < 1 || selection > ${#TAGS[@]})); then
     echo "❌ Invalid selection."
     exit 1
 fi

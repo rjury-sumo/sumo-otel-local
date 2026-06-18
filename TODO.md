@@ -18,20 +18,6 @@ at the current Bash implementation.
 
 ---
 
-## P2 — Medium (reliability / maintainability)
-
-## CI/CD & Releases
-
-- [ ] **Mock-deployment validation job** — stand up a KinD cluster in CI (e.g.
-  `helm/kind-action`), run `helm lint` + `helm template`/`install --dry-run` against
-  `values.yaml` and `examples/*.yaml` with dummy credentials (no live Sumo org).
-  Exercise **both runtimes**: Docker on Linux runners and a Podman-backed KinD provider.
-- [ ] **Release automation** — tag-driven (`v*.*.*`) GitHub Release workflow with SemVer
-  (continue from `0.4.0`) and generated notes; keep the script's `VERSION` constant in
-  sync (see the offline-`version()` P2 item).
-- [ ] **Adopt a versioning/commit convention** — document SemVer bump rules; consider
-  Conventional Commits so notes/bumps can be automated.
-
 ## P3 — Decision: Bash → Python migration
 
 - [ ] **Decide whether to port to Python.** Pros: real arg parsing (`argparse`/`click`),
@@ -132,6 +118,35 @@ at the current Bash implementation.
 
 ### CI / quality (complete)
 
+- [x] **Release automation** (`release-please`) — a `release-please.yml` workflow with
+  `release-please-config.json` and `.release-please-manifest.json`. On each push to `main`
+  it maintains a release PR whose version/`CHANGELOG.md` are derived from the Conventional-
+  Commit (PR-title) subjects since the last release; merging it tags `vX.Y.Z`, publishes a
+  GitHub Release, and rewrites the script's `VERSION` line (annotated
+  `# x-release-please-version`). Anchored at `last-release-sha` = `main` HEAD so old
+  non-conventional subjects are ignored. Uses `RELEASE_PLEASE_TOKEN` (PAT) if set so the
+  release PR runs CI; otherwise the release PR is merged with admin bypass.
+- [x] **Adopted a versioning/commit convention** — [CONTRIBUTING.md](CONTRIBUTING.md)
+  documents SemVer bump rules (with the pre-1.0 `0.x` caveat and the CLI-contract
+  definition of "public API"), Conventional Commits with a type→bump table, the
+  squash-merge implication that **PR titles** are the canonical subjects, and the
+  manual release steps + `VERSION`-constant sync. Sets up the release-automation item.
+- [x] **Mock-deployment validation job** (`mock-deploy`) — adds the `sumologic` repo and
+  renders the upstream chart against `values.yaml` + every `examples/*.yaml` with dummy
+  credentials (mirroring `install_sumo`'s exact `--set` flags), asserts a non-empty render,
+  and schema-checks the output with `kubeconform -ignore-missing-schemas`. Then a KinD
+  cluster (Docker, `helm/kind-action`) pre-applies the chart's 12 CRDs and runs
+  `helm install --dry-run=server` per values file. No live Sumo org required.
+- [x] **Reviewed the KinD server-side dry-run** (2026-06-18) — kept it. Across 4 CI runs
+  it was 4/4 green with no retries; the job is ~85s (render+kubeconform 16s, KinD create
+  39s, CRD apply 5s, server dry-run 18s), on par with the lint jobs — neither flaky nor
+  slow by the review criterion. Added `timeout-minutes: 15` so a future KinD hang fails
+  fast instead of inheriting the 6-hour default. Documented fallback if it ever regresses:
+  drop to `--dry-run=client`, or rely on the cluster-free render+kubeconform gate.
+- [x] **Fixed `examples/metrics_auth.yaml`** — it set the chart-v5-rejected
+  `kube-prometheus-stack.{prometheusOperator,prometheus}.enabled: true` (the render gate
+  caught it). Removed those toggles; the `additionalServiceMonitors` intent is preserved
+  (the ServiceMonitor CRD/operator ship with the chart's bundled dependency). README updated.
 - [x] `shellcheck`-clean and `shfmt -i 4 -ci`-formatted.
 - [x] GitHub Actions CI (`bash -n` + shellcheck + shfmt + yamllint) on an Ubuntu + macOS
   matrix, triggered on PRs and pushes to `dev`.

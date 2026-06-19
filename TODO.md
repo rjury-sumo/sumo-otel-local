@@ -27,25 +27,41 @@ at the current Bash implementation.
   shelling out to `kubectl`/`helm`/`kind`/`podman`/`docker`; add `pyproject.toml`,
   `pytest`, and extend CI.
 
-## P4 — Docs / housekeeping
-
-- [ ] **Update README** — it still says "for MacOS" and references a non-existent
-  `install.sh` (should be `sumo-otel-local.sh`); document macOS **+ Linux**, both
-  runtimes, the env knobs (`CONTAINER_RUNTIME`, `MIN_MEM_MB`, `MIN_CPU`,
-  `SUMOLOGIC_ACCESS_ID/KEY`), and the new Kubernetes-version prompt.
-- [ ] **Add `CLAUDE.md`** (run `/init`) documenting structure, prerequisites, and the
-  install/uninstall flows.
-- [ ] **Document the secret entries** (`sumologic_access_id`/`_key`) per backend
-  (Keychain / secret-tool / env) and how to rotate them.
-- [ ] **`.gitignore` generated artifacts** — the `output` default `sumologic-rendered.yaml`
-  and direct-install leftovers (downloaded `kind`/`kubectl`, podman zips). Currently only
-  `.DS_Store` and `*.tar*` are ignored.
-- [ ] **Lint `manifests/*.yaml` too** — CI's yamllint currently covers `kind-config.yaml`,
-  `values.yaml`, and `examples/*.yaml` but not `manifests/`.
+_P4 backlog clear — see the Done section below._
 
 ---
 
 ## Done
+
+### P4 — Docs / housekeeping (complete)
+
+- [x] **Lint `manifests/*.yaml` in CI** — added `manifests/*.yaml` to the yamllint step.
+  The file failed first (trailing spaces, missing final newline, `#comment` spacing), so
+  fixed those; one non-failing `comments-indentation` warning on a commented-out example
+  annotation block remains (fixing it would misrepresent where the annotations sit).
+- [x] **`.gitignore` generated artifacts** — added `sumologic-rendered.yaml` (the
+  `-o`/--output default, `tee`d into the cwd) and `install_homebrew.sh` (a leftover only
+  if the Homebrew bootstrap fails before its own `rm`). Confirmed via inspection that the
+  jq/kubectl/kind/helm/podman direct-install downloads all go to `/tmp` (then
+  `install_binary` moves them onto PATH), so they never land in the repo — noted in the
+  file instead of adding misleading bare `kind`/`kubectl` ignores.
+- [x] **Documented the secret entries & rotation** — README's "Credentials & secret
+  storage" now names the `sumologic_access_id` / `sumologic_access_key` entries, notes
+  that stored entries are reused silently (so changing creds needs an overwrite/delete),
+  and gives per-backend inspect/rotate/delete commands for Keychain (`security … -U`),
+  libsecret (`secret-tool store`/`clear`), and the env fallback — plus the caveat that
+  `-p`/`--purge` clears them but also tears down the cluster.
+- [x] **Added `CLAUDE.md`** — repo guidance for future work: layout, the script's
+  structure (constants, the flag→flow dispatch table, helper groups), the hard
+  constraints (Bash 3.2, `set -euo pipefail`, no-creds-on-CLI, stderr-for-UI), the exact
+  lint/validate gate, the stub-harness verification approach, and the `dev`/`main` +
+  signed-commit + Conventional-Commit/release-please workflow.
+- [x] **Rewrote README** — now covers macOS **+ Linux** (and `amd64`/`arm64`), fixes the
+  `install.sh` → `sumo-otel-local.sh` references, documents both runtimes, the env knobs
+  (`CONTAINER_RUNTIME`, `MIN_MEM_MB`, `MIN_CPU`, `ASSUME_YES`, `SUMOLOGIC_ACCESS_ID/KEY`),
+  the unattended `-y` mode, the secret backends (Keychain / secret-tool / env), and the
+  `kindest/node` Kubernetes-version prompt. Also partially covers the "document the secret
+  entries" item below (per-backend; rotation still light).
 
 ### P0 — Critical (all complete)
 

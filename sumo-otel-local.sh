@@ -1,6 +1,8 @@
 #!/bin/bash
 
-set -euo pipefail
+# Strict mode and the ERR trap are enabled inside main() (see bottom), not at the top
+# level, so the script can be safely `source`d by the test suite (tests/) to exercise
+# individual functions without running the CLI, enabling errexit, or installing traps.
 
 # Helper Functions
 function help {
@@ -16,6 +18,8 @@ function help {
     echo "  -v, --version   Display the version of the script."
     echo "  -y, --yes       Run unattended: assume yes and use defaults for all prompts."
     echo "                  (also via the ASSUME_YES env var; --non-interactive is an alias)"
+    echo "  -f, --force     Confirm destructive teardown (-u/-p) non-interactively."
+    echo "                  Required for -u/-p under -y; never read from the environment."
 }
 
 # Detect OS and CPU architecture, normalized to the tokens used by release assets.
@@ -71,6 +75,14 @@ CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
 # Helm repository for the Sumo Logic collection.
 SUMO_HELM_REPO_URL="https://sumologic.github.io/sumologic-kubernetes-collection"
 
+# Pinned sumologic/sumologic chart version. The chart is otherwise mutable ("latest"),
+# and a v5 breaking change has already silently broken example values — so install,
+# `output`, and CI all pin this exact version for reproducibility. CI validates the
+# pinned version, so what CI proves is what users deploy. Override deliberately with
+# SUMO_CHART_VERSION=<x.y.z> to try a newer chart. To bump: change this default, re-run
+# the examples through `helm template` (CI's mock-deploy does this), and update docs.
+SUMO_CHART_VERSION="${SUMO_CHART_VERSION:-5.2.0}"
+
 # Script version. Kept in sync with the published GitHub Release tag; printed by
 # -v/--version without any network calls. The trailing annotation lets
 # release-please rewrite this line automatically when it cuts a release.
@@ -79,10 +91,26 @@ VERSION="0.4.0" # x-release-please-version
 # Default KinD cluster name, used by create and teardown.
 DEFAULT_CLUSTER_NAME="sumo"
 
+# Chart overrides applied to EVERY install and render, so `-o`/--output mirrors what
+# `-i`/`-m` deploys. Single source of truth: both install_sumo and output append this,
+# and CI sources the script to reuse it. Per-invocation values (credentials,
+# clusterName, user --values file) are added separately by each flow.
+SUMO_COMMON_SET=(
+    --set-string fullnameOverride=sumo
+    --set sumologic.falco.enabled=false
+    --set sumologic.logs.systemd.enabled=false
+)
+
 # Unattended mode: when set (via -y/--yes/--non-interactive or the ASSUME_YES env
 # var), confirm() auto-answers yes and value prompts use their defaults without
 # blocking on input.
 ASSUME_YES="${ASSUME_YES:-}"
+
+# Explicit confirmation for destructive teardown (-u/-p), set ONLY by the -f/--force
+# flag. Deliberately NOT read from the environment: ASSUME_YES alone must never be able
+# to delete a cluster/machine/credentials, so a stray ASSUME_YES in a shell profile
+# can't trigger an irreversible wipe. See confirm_destructive().
+FORCE=""
 
 # Ask a yes/no question. $1=prompt, $2=default (y|n, default n). Returns 0 for yes.
 # In unattended mode (ASSUME_YES) it answers yes without prompting.
@@ -108,6 +136,38 @@ function ask {
     fi
     read -rp "$prompt" reply
     printf '%s' "${reply:-$default}"
+}
+
+# Gate a destructive teardown (cluster / Podman machine / stored credentials). Sets
+# CLUSTER_NAME to the cluster to remove and returns 0 to proceed. On an interactive
+# "no" or a typed [exit] it prints a cancel message and exits 0.
+#
+# Unlike confirm(), this does NOT proceed under ASSUME_YES alone — unattended teardown
+# requires the explicit -f/--force flag (FORCE), so a stray ASSUME_YES env var cannot
+# trigger an irreversible wipe. With --force it proceeds on the default cluster without
+# prompting. $1 = human description of the action (for messages).
+function confirm_destructive {
+    local action=$1
+    if [[ -n "$FORCE" ]]; then
+        CLUSTER_NAME="$DEFAULT_CLUSTER_NAME"
+        echo "--force: proceeding to ${action} (cluster '${CLUSTER_NAME}') without prompting." >&2
+        return 0
+    fi
+    if [[ -n "$ASSUME_YES" ]]; then
+        echo "Refusing to ${action} in unattended mode (-y/ASSUME_YES) without --force." >&2
+        echo "Re-run with --force to confirm destructive teardown non-interactively." >&2
+        exit 1
+    fi
+    if ! confirm "Are you sure you want to continue?" n; then
+        echo "Cancelling and exiting script..."
+        exit 0
+    fi
+    CLUSTER_NAME=$(ask "Type the name of the cluster (Default: ${DEFAULT_CLUSTER_NAME}) to continue. Type [exit] to cancel: " "$DEFAULT_CLUSTER_NAME")
+    if [[ "$CLUSTER_NAME" == "exit" ]]; then
+        echo "Cancelling and exiting script..."
+        exit 0
+    fi
+    return 0
 }
 
 # Verify required commands exist; exit with clear guidance if any are missing.
@@ -155,6 +215,51 @@ function install_binary {
     echo "Installed $name to $dir"
 }
 
+# Compute the SHA-256 of file $1 (hex, lowercase), using whichever tool is present.
+function sha256_of {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "Error: need 'sha256sum' or 'shasum' to verify downloads; refusing to continue." >&2
+        exit 1
+    fi
+}
+
+# Echo the expected SHA-256 from a remote checksum file at $1. With a filename in $2,
+# select that file's line from a multi-entry list ("<hash>  <file>", tolerating a
+# leading '*'); without $2, use the first line (per-asset .sha256/.sha256sum files).
+function remote_sha256 {
+    local url=$1 name=${2:-}
+    if [[ -n "$name" ]]; then
+        curl -fsSL "$url" | awk -v n="$name" '{f=$2; sub(/^[*]/, "", f); if (f == n) {print $1; exit}}'
+    else
+        curl -fsSL "$url" | awk 'NR==1 {print $1; exit}'
+    fi
+}
+
+# Verify that file $1 matches the expected hex digest $2; abort (and delete the file)
+# on mismatch or when no expected digest is available (fail closed). $3 = label.
+function verify_sha256 {
+    local file=$1 expected=$2 label=${3:-$1} actual
+    expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+    if [[ -z "$expected" ]]; then
+        echo "Error: could not obtain a checksum for ${label}; refusing to install an unverified binary." >&2
+        rm -f "$file"
+        exit 1
+    fi
+    actual=$(sha256_of "$file" | tr 'A-F' 'a-f')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Error: SHA-256 mismatch for ${label} (${file})." >&2
+        echo "  expected: ${expected}" >&2
+        echo "  actual:   ${actual}" >&2
+        rm -f "$file"
+        exit 1
+    fi
+    echo "Verified ${label} checksum." >&2
+}
+
 # Check Dependencies
 function install_dependencies {
 
@@ -175,22 +280,29 @@ function install_dependencies {
             install_dependencies
         else
             echo "Installing Dependencies Directly..."
-            local release
+            local release jq_base kver
             if ! command -v jq &>/dev/null; then
                 echo "Installing jq..."
-                curl -fsSL -o /tmp/jq "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-${JQ_OS}-${ARCH}"
+                jq_base="https://github.com/jqlang/jq/releases/download/jq-1.7.1"
+                curl -fsSL -o /tmp/jq "${jq_base}/jq-${JQ_OS}-${ARCH}"
+                verify_sha256 /tmp/jq "$(remote_sha256 "${jq_base}/sha256sum.txt" "jq-${JQ_OS}-${ARCH}")" jq
                 install_binary /tmp/jq jq
             fi
 
             if ! command -v kubectl &>/dev/null; then
                 echo "Installing Kubectl..."
-                curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/${OS}/${ARCH}/kubectl"
+                kver=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+                curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${kver}/bin/${OS}/${ARCH}/kubectl"
+                verify_sha256 /tmp/kubectl "$(remote_sha256 "https://dl.k8s.io/release/${kver}/bin/${OS}/${ARCH}/kubectl.sha256")" kubectl
                 install_binary /tmp/kubectl kubectl
                 kubectl version --client
             fi
 
             if ! command -v helm &>/dev/null; then
                 echo "Installing Helm..."
+                # get-helm-3 verifies the downloaded helm tarball against its published
+                # SHA-256 itself, so the binary is checksum-checked. (The script is
+                # fetched from a mutable master ref — pinning that is a separate item.)
                 curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
                 chmod 700 /tmp/get_helm.sh
                 /tmp/get_helm.sh
@@ -203,6 +315,7 @@ function install_dependencies {
                 if [[ "$OS" == "darwin" ]]; then
                     release=$(curl -fsSL https://api.github.com/repos/containers/podman/releases/latest | jq -r .tag_name)
                     curl -fsSL -o /tmp/podman.zip "https://github.com/containers/podman/releases/download/${release}/podman-remote-release-darwin_${ARCH}.zip"
+                    verify_sha256 /tmp/podman.zip "$(remote_sha256 "https://github.com/containers/podman/releases/download/${release}/shasums" "podman-remote-release-darwin_${ARCH}.zip")" podman
                     rm -rf /tmp/podman-extract
                     unzip -q /tmp/podman.zip -d /tmp/podman-extract
                     install_binary "/tmp/podman-extract/podman-${release}/usr/bin/podman" podman
@@ -224,6 +337,7 @@ function install_dependencies {
                 echo "Installing Kind..."
                 release=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kind/releases/latest | jq -r .tag_name)
                 curl -fsSL -o /tmp/kind "https://kind.sigs.k8s.io/dl/${release}/kind-${OS}-${ARCH}"
+                verify_sha256 /tmp/kind "$(remote_sha256 "https://github.com/kubernetes-sigs/kind/releases/download/${release}/kind-${OS}-${ARCH}.sha256sum" "kind-${OS}-${ARCH}")" kind
                 install_binary /tmp/kind kind
             fi
         fi
@@ -588,13 +702,12 @@ EOF
 
     # Build the helm args; only include the user values file when one is in use.
     local helm_args=(upgrade --install sumologic sumologic/sumologic
+        --version "$SUMO_CHART_VERSION"
         --namespace=sumologic --create-namespace)
     [[ -n "$HELM_VALUES" ]] && helm_args+=(--values "$HELM_VALUES")
     helm_args+=(--values "$secrets_file")
     helm_args+=(--set-string "sumologic.clusterName=${CLUSTER_NAME}")
-    helm_args+=(--set-string fullnameOverride=sumo)
-    helm_args+=(--set sumologic.falco.enabled=false)
-    helm_args+=(--set sumologic.logs.systemd.enabled=false)
+    helm_args+=("${SUMO_COMMON_SET[@]}")
 
     helm "${helm_args[@]}"
 }
@@ -609,17 +722,37 @@ function output {
         HELM_VALUES="$DEFAULT_HELM_VALUES"
     fi
     [[ -n "$HELM_VALUES" ]] && require_values_file "$HELM_VALUES"
+    CLUSTER_NAME=$(ask "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
     K8S_YAML=$(ask "Name and Location of the rendered Kubernetes Manifest YAML file. [default=sumologic-rendered.yaml]: " "$DEFAULT_K8S_YAML")
 
     # The chart is referenced as sumologic/sumologic, so the repo must be registered.
     ensure_helm_repo
 
-    # Only pass -f when a values file is in use; the chart renders with defaults otherwise.
-    local template_args=(template --namespace=sumologic --create-namespace)
-    [[ -n "$HELM_VALUES" ]] && template_args+=(-f "$HELM_VALUES")
-    template_args+=(sumologic sumologic/sumologic)
+    # The chart requires accessId/accessKey to render. Use PLACEHOLDER credentials so
+    # the rendered manifest is faithful in structure without writing real secrets to the
+    # output file; deploy with -i/-m, which inject real credentials securely. Placeholders
+    # go via a private temp values file (consistent with install_sumo) rather than argv.
+    secrets_file=$(mktemp)
+    chmod 600 "$secrets_file"
+    trap 'rm -f "$secrets_file"' EXIT
+    cat >"$secrets_file" <<'EOF'
+sumologic:
+  accessId: "PLACEHOLDER_ACCESS_ID"
+  accessKey: "PLACEHOLDER_ACCESS_KEY"
+EOF
+
+    # Mirror install_sumo's args so the rendered manifest matches what -i/-m deploys:
+    # optional user values, then placeholder creds, clusterName, and the shared overrides.
+    local template_args=(template sumologic sumologic/sumologic
+        --version "$SUMO_CHART_VERSION"
+        --namespace=sumologic --create-namespace)
+    [[ -n "$HELM_VALUES" ]] && template_args+=(--values "$HELM_VALUES")
+    template_args+=(--values "$secrets_file")
+    template_args+=(--set-string "sumologic.clusterName=${CLUSTER_NAME}")
+    template_args+=("${SUMO_COMMON_SET[@]}")
 
     helm "${template_args[@]}" | tee "${K8S_YAML}"
+    echo "Note: the rendered Secret uses placeholder credentials; deploy with -i/-m to inject real ones." >&2
 }
 
 function uninstall {
@@ -629,21 +762,11 @@ function uninstall {
     set_kind_provider
 
     echo "Caution: This will delete the cluster"
-    if confirm "Are you sure you want to continue?" n; then
-        CLUSTER_NAME=$(ask "Type the name of the cluster (Default: ${DEFAULT_CLUSTER_NAME}) to continue. Type [exit] to cancel: " "$DEFAULT_CLUSTER_NAME")
-        if [[ $CLUSTER_NAME == "exit" ]]; then
-            echo "Cancelling and exiting script..."
-            exit 0
-        else
-            echo "Deleting Cluster: ${CLUSTER_NAME}"
-            kind delete cluster --name "${CLUSTER_NAME}"
-            if [[ "$CONTAINER_RUNTIME" == "podman" && "$OS" == "darwin" ]]; then
-                echo "Leaving Podman machine intact (use --purge to remove it)."
-            fi
-        fi
-    else
-        echo "Cancelling and exiting script..."
-        exit 0
+    confirm_destructive "delete the cluster"
+    echo "Deleting Cluster: ${CLUSTER_NAME}"
+    kind delete cluster --name "${CLUSTER_NAME}"
+    if [[ "$CONTAINER_RUNTIME" == "podman" && "$OS" == "darwin" ]]; then
+        echo "Leaving Podman machine intact (use --purge to remove it)."
     fi
 }
 
@@ -664,23 +787,13 @@ function purge {
         echo "Caution: This will delete the cluster. (No Podman machine to remove under ${CONTAINER_RUNTIME}.)"
     fi
 
-    if confirm "Are you sure you want to continue?" n; then
-        CLUSTER_NAME=$(ask "Type the name of the cluster (Default: ${DEFAULT_CLUSTER_NAME}) to continue. Type [exit] to cancel: " "$DEFAULT_CLUSTER_NAME")
-        if [[ $CLUSTER_NAME == "exit" ]]; then
-            echo "Cancelling and exiting script..."
-            exit 0
-        else
-            echo "Deleting Cluster: ${CLUSTER_NAME}"
-            kind delete cluster --name "${CLUSTER_NAME}"
-            if [[ "$has_machine" == "yes" && -n "$running_machine" ]]; then
-                echo "Stopping and Removing the - ${running_machine} - Podman Machine..."
-                podman machine stop "${running_machine}"
-                podman machine rm "${running_machine}"
-            fi
-        fi
-    else
-        echo "Cancelling and exiting script..."
-        exit 0
+    confirm_destructive "delete the cluster and remove the Podman machine"
+    echo "Deleting Cluster: ${CLUSTER_NAME}"
+    kind delete cluster --name "${CLUSTER_NAME}"
+    if [[ "$has_machine" == "yes" && -n "$running_machine" ]]; then
+        echo "Stopping and Removing the - ${running_machine} - Podman Machine..."
+        podman machine stop "${running_machine}"
+        podman machine rm "${running_machine}"
     fi
 
     if secret_delete sumologic_access_id; then
@@ -878,57 +991,74 @@ function on_error {
     echo "Nothing has been changed or removed. To tear down a cluster, re-run with -u/--uninstall or -p/--purge." >&2
     exit "${exit_code}"
 }
-trap 'on_error ${LINENO}' ERR
 
-# Parse Arguments
-while [[ $# -gt 0 ]]; do
-    key="$1"
-    case $key in
-        -h | --help)
-            help
-            exit 0
-            ;;
-        -i | --install)
-            install_dependencies
-            init_cluster
-            install_sumo
-            exit 0
-            ;;
-        -n | --init)
-            install_dependencies
-            init_cluster
-            exit 0
-            ;;
-        -m | --helm)
-            install_sumo
-            exit 0
-            ;;
-        -o | --output)
-            output
-            exit 0
-            ;;
-        -p | --purge)
-            purge
-            exit 0
-            ;;
-        -u | --uninstall)
-            uninstall
-            exit 0
-            ;;
-        -v | --version)
-            version
-            exit 0
-            ;;
-        -y | --yes | --non-interactive)
-            # Modifier (not an action): enable unattended mode, then process the
-            # remaining args. Place before the action flag, e.g. `-y -i`.
-            ASSUME_YES="yes"
-            ;;
-        *)
-            echo "Invalid Option: $1"
-            help
-            exit 1
-            ;;
-    esac
-    shift
-done
+# Entry point. Enabling strict mode and the ERR trap here (rather than at the top
+# level) keeps the script sourceable by the test suite without side effects.
+function main {
+    set -euo pipefail
+    trap 'on_error ${LINENO}' ERR
+
+    # Parse Arguments
+    while [[ $# -gt 0 ]]; do
+        key="$1"
+        case $key in
+            -h | --help)
+                help
+                exit 0
+                ;;
+            -i | --install)
+                install_dependencies
+                init_cluster
+                install_sumo
+                exit 0
+                ;;
+            -n | --init)
+                install_dependencies
+                init_cluster
+                exit 0
+                ;;
+            -m | --helm)
+                install_sumo
+                exit 0
+                ;;
+            -o | --output)
+                output
+                exit 0
+                ;;
+            -p | --purge)
+                purge
+                exit 0
+                ;;
+            -u | --uninstall)
+                uninstall
+                exit 0
+                ;;
+            -v | --version)
+                version
+                exit 0
+                ;;
+            -y | --yes | --non-interactive)
+                # Modifier (not an action): enable unattended mode, then process the
+                # remaining args. Place before the action flag, e.g. `-y -i`.
+                ASSUME_YES="yes"
+                ;;
+            -f | --force)
+                # Modifier (not an action): explicitly confirm destructive teardown
+                # (-u/-p) so it can run without prompting. Place before the action flag,
+                # e.g. `--force -p` or `-y --force -p`.
+                FORCE="yes"
+                ;;
+            *)
+                echo "Invalid Option: $1"
+                help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# Run main only when executed directly, not when sourced (e.g. by the test suite).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -41,8 +41,11 @@ chmod +x sumo-otel-local.sh
 ./sumo-otel-local.sh -i
 ```
 
-Follow the in-script prompts. To tear everything down again, use `-u` (cluster) or
-`-p` (cluster and, with Podman on macOS, the Podman machine).
+Follow the in-script prompts. Install offers to **wait for the collector pods to become
+ready** (`helm --wait`) and, on success, prints copy-paste next steps (watch pods, tail
+the collector logs, run `-s`/`--status`, and verify data in Sumo); on failure it points
+you at `-s`. To tear everything down again, use `-u` (cluster) or `-p` (cluster and, with
+Podman on macOS, the Podman machine).
 
 ## Commands
 
@@ -63,9 +66,12 @@ Options:
                   Required for -u/-p under -y; never read from the environment.
 ```
 
-`-y`/`--yes` is a modifier, combine it with an action, e.g. `./sumo-otel-local.sh -y -i`.
-In unattended mode the Sumo credentials **must** come from secret storage or the
-environment (the script will not block on a prompt).
+Exactly one **action** (`-i`/`-n`/`-m`/`-o`/`-p`/`-u`/`-v`) is run per invocation;
+giving two different actions is rejected with a clear error, and `-h`/`--help` always
+wins. `-y`/`--yes` and `-f`/`--force` are **modifiers** and are order-independent —
+combine either with an action in any order, e.g. `./sumo-otel-local.sh -y -i` or
+`./sumo-otel-local.sh -i -y`. In unattended mode the Sumo credentials **must** come from
+secret storage or the environment (the script will not block on a prompt).
 
 ### Destructive teardown requires `--force` when unattended
 
@@ -73,7 +79,7 @@ environment (the script will not block on a prompt).
 stray `ASSUME_YES` (e.g. exported in a shell profile) must never be able to delete a
 cluster, Podman machine, or your stored credentials. To tear down without prompts, pass
 the explicit `-f`/`--force` flag (which, unlike `ASSUME_YES`, is **never** read from the
-environment), placed before the action:
+environment); like `-y`, it can go before or after the action:
 
 ```bash
 ./sumo-otel-local.sh --force -u        # delete the cluster, no prompt
@@ -82,6 +88,23 @@ environment), placed before the action:
 
 Without `--force`, `-y -p` refuses and exits non-zero. Run `-u`/`-p` with no flags for
 the normal interactive confirm + type-the-cluster-name guard.
+
+## Checking status
+
+`-s`/`--status` is a **read-only** doctor command — it changes nothing and reports:
+
+- the selected container runtime + KinD provider;
+- on macOS with Podman, the Podman machine(s) and their running state;
+- whether the KinD cluster exists (prompts for the name, default `sumo`);
+- the Sumo collector Helm release (`helm status sumologic -n sumologic`); and
+- the collector pods (`kubectl get pods -n sumologic`).
+
+```bash
+./sumo-otel-local.sh -s
+```
+
+Every probe is non-fatal: a missing runtime, cluster, release, pod, or CLI tool is
+reported as "not found"/"not installed" rather than erroring out.
 
 ## Configuration
 
@@ -96,8 +119,11 @@ The script reads a few environment variables; all are optional.
 - **`ASSUME_YES`** (default: _unset_) — any non-empty value runs unattended (same as `-y`).
 - **`SUMO_CHART_VERSION`** (default: pinned in the script) — the `sumologic/sumologic`
   chart version that install and `-o`/--output use. Pinned for reproducibility (CI
-  validates the pinned version); override to try a newer chart, e.g.
-  `SUMO_CHART_VERSION=5.3.0`.
+  validates the pinned version). Set it in the environment to use a specific version
+  without prompting, e.g. `SUMO_CHART_VERSION=5.3.0`. When **not** set in the
+  environment, an interactive run lets you pick a version from the available list
+  (or enter one), defaulting to the pin; unattended runs (`-y`) use the pin. The chosen
+  version is echoed on install so runs are reproducible.
 - **`SUMOLOGIC_ACCESS_ID`** / **`SUMOLOGIC_ACCESS_KEY`** (default: _unset_) — your Sumo
   credentials, used when no secret backend is available (see below).
 
@@ -108,6 +134,16 @@ CONTAINER_RUNTIME=docker MIN_MEM_MB=8192 MIN_CPU=2 \
   SUMOLOGIC_ACCESS_ID=xxxx SUMOLOGIC_ACCESS_KEY=yyyy \
   ./sumo-otel-local.sh -y -i
 ```
+
+### Project config file
+
+For repeatable runs, drop a **`.sumo-otel-local.env`** in your working directory and the
+script sources it on startup (it's plain shell — `KEY=value` lines, no YAML parser). It
+can set any of the knobs above (`CONTAINER_RUNTIME`, `CLUSTER_NAME`, `SUMO_CHART_VERSION`,
+`HELM_VALUES`, `MIN_MEM_MB`, `MIN_CPU`, `ASSUME_YES`) so you don't re-answer prompts.
+Copy [`.sumo-otel-local.env.example`](.sumo-otel-local.env.example) to get started; the
+real file is git-ignored. Point `SUMO_CONFIG_FILE` at another path, or `=/dev/null` to
+ignore it for a run. For safety it **cannot** enable `--force` or carry credentials.
 
 ## Credentials & secret storage
 

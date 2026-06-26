@@ -87,3 +87,43 @@ setup() {
     MIN_CPU=2 run bash -c 'source "$1"; echo "$MIN_CPU"' _ "$SCRIPT"
     [ "$output" = "2" ]
 }
+
+@test "runtime tool versions default to their pins" {
+    run bash -c 'source "$1"; echo "$KUBECTL_VERSION $HELM_VERSION $KIND_VERSION $PODMAN_VERSION"' _ "$SCRIPT"
+    [ "$output" = "v1.36.2 v4.2.2 v0.32.0 v6.0.0" ]
+}
+
+@test "runtime tool versions are overridable via the environment" {
+    KIND_VERSION=v0.30.0 KUBECTL_VERSION=v1.30.0 run bash -c 'source "$1"; echo "$KUBECTL_VERSION $KIND_VERSION"' _ "$SCRIPT"
+    [ "$output" = "v1.30.0 v0.30.0" ]
+}
+
+@test "SCRIPT_DIR resolves to the script directory holding the bundled assets" {
+    run bash -c 'source "$1"; echo "$SCRIPT_DIR"' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ -f "$output/kind-config.yaml" ]
+    [ -f "$output/values.yaml" ]
+}
+
+@test "KINDEST_NODE_VERSION defaults to the pin and is overridable" {
+    run bash -c 'source "$1"; echo "$KINDEST_NODE_VERSION"' _ "$SCRIPT"
+    [ "$output" = "v1.36.1" ]
+    KINDEST_NODE_VERSION=v1.30.0 run bash -c 'source "$1"; echo "$KINDEST_NODE_VERSION"' _ "$SCRIPT"
+    [ "$output" = "v1.30.0" ]
+}
+
+@test "secret_set (keychain): tolerates unset USER under set -u and uses -U" {
+    run bash -c '
+        source "$1"
+        set -u
+        SECRET_BACKEND=keychain
+        security() { printf "security %s\n" "$*"; }
+        unset USER LOGNAME
+        secret_set sumologic_access_id mysecret
+    ' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *" -U "* ]]
+    [[ "$output" == *"-s sumologic_access_id"* ]]
+    # The account passed to -a must be non-empty (USER/LOGNAME fell back to id -un).
+    printf '%s\n' "$output" | grep -Eq -- '-a [^[:space:]]+'
+}

@@ -51,6 +51,12 @@ else
     JQ_OS="linux"
 fi
 
+# Directory holding this script, so bundled assets (kind-config.yaml, values.yaml)
+# resolve no matter the caller's CWD. Bash 3.2-safe; works whether the script is run
+# or sourced (BASH_SOURCE[0] is the script path either way). User-supplied --values
+# paths stay relative to the CWD — only the bundled defaults are anchored here.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 # Choose a secret-storage backend: macOS Keychain, Linux libsecret (secret-tool),
 # or an environment-variable fallback when neither is available.
 if [[ "$OS" == "darwin" ]] && command -v security &>/dev/null; then
@@ -106,6 +112,30 @@ else
 fi
 # renovate: datasource=helm depName=sumologic registryUrl=https://sumologic.github.io/sumologic-kubernetes-collection
 SUMO_CHART_VERSION="${SUMO_CHART_VERSION:-5.2.0}"
+
+# Pinned versions for the CLIs the direct-download path installs (the no-Homebrew
+# fallback). Each is env-overridable (e.g. KIND_VERSION=v0.30.0) and tracked by
+# Renovate via the annotations below. Pinning replaces the old "latest"/"stable"
+# lookups — including their unauthenticated GitHub API calls — so direct installs are
+# reproducible and match the toolchain CI validates. NOTE: the Homebrew path always
+# installs brew's current formula; these pins apply only to the direct-download path.
+# renovate: datasource=github-releases depName=kubernetes/kubernetes
+KUBECTL_VERSION="${KUBECTL_VERSION:-v1.36.2}"
+# renovate: datasource=github-releases depName=helm/helm
+HELM_VERSION="${HELM_VERSION:-v4.2.2}"
+# renovate: datasource=github-releases depName=kubernetes-sigs/kind
+KIND_VERSION="${KIND_VERSION:-v0.32.0}"
+# renovate: datasource=github-releases depName=containers/podman
+PODMAN_VERSION="${PODMAN_VERSION:-v6.0.0}"
+
+# Pinned kindest/node image — the Kubernetes version the KinD cluster runs. This is the
+# default node image that kind ${KIND_VERSION} ships and tests with, so it pairs with the
+# pinned kind and renders/validates against the pinned chart. Used as the default in
+# init_cluster; select_node_image still lets you pick another version interactively.
+# Deliberately NOT Renovate-annotated: the node image is coupled to KIND_VERSION (it must
+# fall in kind's supported range), so bump it together with kind, not independently.
+# Known-good digest (kind v0.32.0 default): sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+KINDEST_NODE_VERSION="${KINDEST_NODE_VERSION:-v1.36.1}"
 
 # Script version. Kept in sync with the published GitHub Release tag; printed by
 # -v/--version without any network calls. The trailing annotation lets
@@ -291,6 +321,9 @@ function install_dependencies {
 
     if command -v brew &>/dev/null; then
         echo "Installing Dependencies with Homebrew..."
+        # Homebrew always installs the current formula version; the KIND_VERSION /
+        # KUBECTL_VERSION / HELM_VERSION / PODMAN_VERSION pins apply only to the
+        # direct-download fallback below, so brew pinning is best-effort (none here).
         # Only install a container runtime when the user has neither already.
         local brew_pkgs=(jq kubectl helm kind)
         if ! command -v docker &>/dev/null && ! command -v podman &>/dev/null; then
@@ -306,7 +339,7 @@ function install_dependencies {
             install_dependencies
         else
             echo "Installing Dependencies Directly..."
-            local release jq_base kver
+            local jq_base ver
             if ! command -v jq &>/dev/null; then
                 echo "Installing jq..."
                 jq_base="https://github.com/jqlang/jq/releases/download/jq-1.7.1"
@@ -316,36 +349,38 @@ function install_dependencies {
             fi
 
             if ! command -v kubectl &>/dev/null; then
-                echo "Installing Kubectl..."
-                kver=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-                curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${kver}/bin/${OS}/${ARCH}/kubectl"
-                verify_sha256 /tmp/kubectl "$(remote_sha256 "https://dl.k8s.io/release/${kver}/bin/${OS}/${ARCH}/kubectl.sha256")" kubectl
+                echo "Installing Kubectl ${KUBECTL_VERSION}..."
+                curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/${OS}/${ARCH}/kubectl"
+                verify_sha256 /tmp/kubectl "$(remote_sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/${OS}/${ARCH}/kubectl.sha256")" kubectl
                 install_binary /tmp/kubectl kubectl
                 kubectl version --client
             fi
 
             if ! command -v helm &>/dev/null; then
-                echo "Installing Helm..."
+                echo "Installing Helm ${HELM_VERSION}..."
                 # get-helm-3 verifies the downloaded helm tarball against its published
-                # SHA-256 itself, so the binary is checksum-checked. (The script is
-                # fetched from a mutable master ref — pinning that is a separate item.)
+                # SHA-256 itself, so the binary is checksum-checked; DESIRED_VERSION pins
+                # which helm version it installs. (The script is fetched from a mutable
+                # master ref — pinning that is a separate item.)
                 curl -fsSL -o /tmp/get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
                 chmod 700 /tmp/get_helm.sh
-                /tmp/get_helm.sh
+                DESIRED_VERSION="$HELM_VERSION" /tmp/get_helm.sh
                 rm -f /tmp/get_helm.sh
             fi
 
             # Only auto-install a runtime when the user has neither Docker nor Podman.
             if ! command -v docker &>/dev/null && ! command -v podman &>/dev/null; then
-                echo "Installing Podman..."
+                echo "Installing Podman ${PODMAN_VERSION}..."
                 if [[ "$OS" == "darwin" ]]; then
-                    release=$(curl -fsSL https://api.github.com/repos/containers/podman/releases/latest | jq -r .tag_name)
-                    curl -fsSL -o /tmp/podman.zip "https://github.com/containers/podman/releases/download/${release}/podman-remote-release-darwin_${ARCH}.zip"
-                    verify_sha256 /tmp/podman.zip "$(remote_sha256 "https://github.com/containers/podman/releases/download/${release}/shasums" "podman-remote-release-darwin_${ARCH}.zip")" podman
+                    # The release tag carries a leading 'v' (used in the URL); the zip's
+                    # internal directory does not (podman-6.0.0/, not podman-v6.0.0/).
+                    ver="${PODMAN_VERSION#v}"
+                    curl -fsSL -o /tmp/podman.zip "https://github.com/containers/podman/releases/download/${PODMAN_VERSION}/podman-remote-release-darwin_${ARCH}.zip"
+                    verify_sha256 /tmp/podman.zip "$(remote_sha256 "https://github.com/containers/podman/releases/download/${PODMAN_VERSION}/shasums" "podman-remote-release-darwin_${ARCH}.zip")" podman
                     rm -rf /tmp/podman-extract
                     unzip -q /tmp/podman.zip -d /tmp/podman-extract
-                    install_binary "/tmp/podman-extract/podman-${release}/usr/bin/podman" podman
-                    install_binary "/tmp/podman-extract/podman-${release}/usr/bin/podman-mac-helper" podman-mac-helper
+                    install_binary "/tmp/podman-extract/podman-${ver}/usr/bin/podman" podman
+                    install_binary "/tmp/podman-extract/podman-${ver}/usr/bin/podman-mac-helper" podman-mac-helper
                     rm -rf /tmp/podman.zip /tmp/podman-extract
                 else
                     # On Linux, Podman runs natively (no VM/machine) and needs rootless
@@ -360,10 +395,9 @@ function install_dependencies {
             fi
 
             if ! command -v kind &>/dev/null; then
-                echo "Installing Kind..."
-                release=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kind/releases/latest | jq -r .tag_name)
-                curl -fsSL -o /tmp/kind "https://kind.sigs.k8s.io/dl/${release}/kind-${OS}-${ARCH}"
-                verify_sha256 /tmp/kind "$(remote_sha256 "https://github.com/kubernetes-sigs/kind/releases/download/${release}/kind-${OS}-${ARCH}.sha256sum" "kind-${OS}-${ARCH}")" kind
+                echo "Installing Kind ${KIND_VERSION}..."
+                curl -fsSL -o /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-${OS}-${ARCH}"
+                verify_sha256 /tmp/kind "$(remote_sha256 "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-${OS}-${ARCH}.sha256sum" "kind-${OS}-${ARCH}")" kind
                 install_binary /tmp/kind kind
             fi
         fi
@@ -645,16 +679,25 @@ function init_cluster {
         esac
     fi
 
-    if confirm "KinD will install the latest Kubernetes version. OK?" y; then
-        kind create cluster --name "${CLUSTER_NAME}" --config kind-config.yaml
+    # Anchor the bundled cluster config to the script dir (not the CWD) and fail early
+    # with a clear message if it's missing, instead of letting kind emit a raw error.
+    local kind_config="$SCRIPT_DIR/kind-config.yaml"
+    if [[ ! -f "$kind_config" ]]; then
+        echo "Error: bundled kind-config.yaml not found at '${kind_config}'." >&2
+        echo "Run the script from its repository clone (kind-config.yaml ships alongside it)." >&2
+        exit 1
+    fi
+
+    if confirm "Create the cluster with the pinned Kubernetes version (kindest/node:${KINDEST_NODE_VERSION})?" y; then
+        kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "kindest/node:${KINDEST_NODE_VERSION}"
     else
         node_image=$(select_node_image)
         if [[ -n "$node_image" ]]; then
             echo "Creating cluster '${CLUSTER_NAME}' with ${node_image}..."
-            kind create cluster --name "${CLUSTER_NAME}" --config kind-config.yaml --image "${node_image}"
+            kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "${node_image}"
         else
             echo "No version selected; using KinD's default node image."
-            kind create cluster --name "${CLUSTER_NAME}" --config kind-config.yaml
+            kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config"
         fi
     fi
 }
@@ -716,9 +759,18 @@ function secret_get {
 
 # Store a secret for reuse on the next run.
 function secret_set {
-    local name=$1 value=$2 var
+    local name=$1 value=$2 var account
     case "$SECRET_BACKEND" in
-        keychain) security add-generic-password -a "$USER" -s "$name" -w "$value" ;;
+        keychain)
+            # The account label is cosmetic here; fall back when USER is unset so the
+            # command doesn't abort under `set -u` (id -un is portable and TTY-free).
+            account="${USER:-${LOGNAME:-$(id -un 2>/dev/null || echo unknown)}}"
+            # -U updates an existing item in place, so re-storing is idempotent instead
+            # of failing on a pre-existing entry. NOTE: `security` has no stdin-password
+            # mode, so -w briefly exposes the value on this process's argv (local only);
+            # the secret-tool backend below reads the value from stdin, which is the model.
+            security add-generic-password -U -a "$account" -s "$name" -w "$value"
+            ;;
         secret-tool) printf '%s' "$value" | secret-tool store --label="$name" service "$name" ;;
         env)
             var=$(secret_env_var "$name")
@@ -767,7 +819,7 @@ function install_sumo {
         secret_set sumologic_access_key "$ACCESS_KEY"
     fi
 
-    DEFAULT_HELM_VALUES="values.yaml"
+    DEFAULT_HELM_VALUES="$SCRIPT_DIR/values.yaml"
     echo "A Helm values file is optional; the chart can install with --set values alone."
     echo "Example values live in the examples folder, e.g. examples/metrics_interval.yaml"
     HELM_VALUES=$(ask "Path to a Helm values file (blank to skip) [default if present=${DEFAULT_HELM_VALUES}]: " "${HELM_VALUES:-}")
@@ -844,7 +896,7 @@ EOF
 
 function output {
     require_cmd helm
-    DEFAULT_HELM_VALUES="values.yaml"
+    DEFAULT_HELM_VALUES="$SCRIPT_DIR/values.yaml"
     DEFAULT_K8S_YAML="sumologic-rendered.yaml"
 
     HELM_VALUES=$(ask "Path to a Helm values file (blank to skip) [default if present=${DEFAULT_HELM_VALUES}]: " "${HELM_VALUES:-}")

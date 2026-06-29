@@ -75,6 +75,42 @@ setup() {
     [ "$output" = "sumo" ]
 }
 
+@test "read_secret: stdout is exactly the entered value (no prompt/warning leakage)" {
+    # Two empty lines then the value; stderr discarded so $output is the captured stdout.
+    run bash -c 'source "$1"; printf "\n\nhunter2\n" | read_secret "PW: " 2>/dev/null' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ "$output" = "hunter2" ]
+}
+
+@test "read_secret: re-prompts on empty input (warning goes to stderr)" {
+    # stdout discarded so $output is stderr: the empty-value warning must appear there.
+    run bash -c 'source "$1"; printf "\nhunter2\n" | read_secret "PW: " 1>/dev/null' _ "$SCRIPT"
+    [[ "$output" == *"cannot be empty"* ]]
+}
+
+@test "read_secret: aborts on EOF/closed stdin instead of looping forever" {
+    run bash -c 'source "$1"; read_secret "PW: " </dev/null' _ "$SCRIPT"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"stdin closed"* ]]
+}
+
+@test "ask: EOF/closed stdin falls back to the default without aborting (note on stderr)" {
+    # Captured via $() under set -e: an unguarded read would fail and abort the caller.
+    run bash -c 'source "$1"; set -Eeuo pipefail; trap "echo ERR_TRAP" ERR; ASSUME_YES=""
+        val=$(ask "name? " "sumo" </dev/null); echo "VAL=$val"' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"VAL=sumo"* ]]     # returned the default
+    [[ "$output" != *"ERR_TRAP"* ]]     # did not trip the ERR trap
+    [[ "$output" == *"stdin closed"* ]] # noted the fallback
+}
+
+@test "confirm: EOF/closed stdin uses the default (n->no, y->yes), no abort" {
+    run bash -c 'source "$1"; set -Eeuo pipefail; ASSUME_YES=""; confirm "ok?" n </dev/null' _ "$SCRIPT"
+    [ "$status" -eq 1 ] # default n -> rejected
+    run bash -c 'source "$1"; set -Eeuo pipefail; ASSUME_YES=""; confirm "ok?" y </dev/null' _ "$SCRIPT"
+    [ "$status" -eq 0 ] # default y -> accepted
+}
+
 # --- MIN_* validation (top-level guard) -------------------------------------
 
 @test "MIN_MEM_MB validation: non-integer aborts sourcing" {

@@ -187,7 +187,12 @@ function confirm {
         echo "${prompt} ${hint} y (assumed)" >&2
         return 0
     fi
-    read -rp "${prompt} ${hint} " reply
+    # On EOF/closed stdin (e.g. piped input with no -y) fall back to the default with a
+    # clear note, rather than letting the unguarded read fail and abort via the ERR trap.
+    if ! read -rp "${prompt} ${hint} " reply; then
+        echo "No input (stdin closed); using default '${default}'. Pass -y to run unattended." >&2
+        reply=$default
+    fi
     reply=${reply:-$default}
     [[ "$reply" =~ ^[Yy]$ ]]
 }
@@ -200,8 +205,35 @@ function ask {
         printf '%s' "$default"
         return 0
     fi
-    read -rp "$prompt" reply
+    # On EOF/closed stdin (e.g. piped input with no -y) fall back to the default with a
+    # note on stderr, rather than letting the unguarded read fail and abort via the ERR
+    # trap (ask is captured with $(...), so the note must not go to stdout).
+    if ! read -rp "$prompt" reply; then
+        echo "No input (stdin closed); using default '${default}'. Pass -y to run unattended." >&2
+    fi
     printf '%s' "${reply:-$default}"
+}
+
+# Prompt silently for a secret, re-prompting until a non-empty value is entered, and
+# echo it to stdout (for $(...) capture). Prompt and warnings go to stderr (so they
+# don't pollute the captured value), per the stderr-for-UI/stdout-for-result convention.
+# Aborts (return 1) on EOF/closed stdin rather than looping forever — callers reach this
+# only on the interactive path (the unattended path errors before prompting).
+function read_secret {
+    local prompt=$1 value
+    while true; do
+        if ! read -rsp "$prompt" value; then
+            echo "" >&2
+            echo "No input (stdin closed); aborting." >&2
+            return 1
+        fi
+        echo "" >&2
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+        echo "Value cannot be empty; please try again." >&2
+    done
 }
 
 # Gate a destructive teardown (cluster / Podman machine / stored credentials). Sets
@@ -832,8 +864,7 @@ function install_sumo {
             exit 1
         fi
         echo "Sumo Logic Access ID not found in secret storage"
-        read -rsp "Enter Sumo Logic Access ID: " ACCESS_ID
-        echo ""
+        ACCESS_ID=$(read_secret "Enter Sumo Logic Access ID: ") || exit 1
         secret_set sumologic_access_id "$ACCESS_ID"
     fi
 
@@ -843,8 +874,7 @@ function install_sumo {
             exit 1
         fi
         echo "Sumo Logic Access Key not found in secret storage"
-        read -rsp "Enter Sumo Logic Access Key: " ACCESS_KEY
-        echo ""
+        ACCESS_KEY=$(read_secret "Enter Sumo Logic Access Key: ") || exit 1
         secret_set sumologic_access_key "$ACCESS_KEY"
     fi
 
@@ -1203,6 +1233,17 @@ function new_podman {
     DEFAULT_NAME="sumo"
     DEFAULT_MEMORY="${MIN_MEM_MB}" # default a new machine to the configured minimum
     MEMORY=$(ask "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " "$DEFAULT_MEMORY")
+    # Validate before handing it to `podman machine init --memory`, which otherwise fails
+    # cryptically on non-numeric input. Reject non-integers hard; warn (don't block) when
+    # below the minimum, matching check_docker_resources' tone for a deliberate choice.
+    if ! [[ "$MEMORY" =~ ^[0-9]+$ ]]; then
+        echo "Error: memory must be a positive integer (MiB), got '${MEMORY}'." >&2
+        return 1
+    fi
+    MEMORY=$((10#$MEMORY)) # normalize: strip leading zeros so the comparison isn't read as octal
+    if [[ "$MEMORY" -lt "$MIN_MEM_MB" ]]; then
+        echo "⚠️  ${MEMORY}MiB is below the recommended minimum (${MIN_MEM_MB}MiB); the Sumo stack may be unstable." >&2
+    fi
     NAME=$(ask "Name of the Podman machine [default=${DEFAULT_NAME}]: " "$DEFAULT_NAME")
 
     # Free the single run slot before creating/starting the new machine.

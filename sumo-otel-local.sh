@@ -11,9 +11,12 @@ function help {
     echo "  -h, --help      Display this help message."
     echo "  -i, --install   Install the dependencies and setup the Sumo Operator."
     echo "  -n, --init      Install dependencies without setting up the Sumo Operator."
-    echo "  -m, --helm      Install Sumo Operator onto existing cluster."
+    echo "  -m, --helm      Install or upgrade the Sumo collector on an existing cluster."
+    echo "  -r, --reinstall Uninstall the Sumo collector then reinstall it (cluster stays)."
     echo "  -o, --output    Output the rendered Kubernetes manifest YAML file."
     echo "  -s, --status    Report cluster and collector health (read-only)."
+    echo "  -e, --endpoints Print the Sumo collection endpoints from the 'sumologic' secret."
+    echo "      --forward   Port-forward the traces collector's OTLP receiver to localhost:4317/4318."
     echo "  -p, --purge     Uninstall the cluster (and, with Podman on macOS, the Podman machine)."
     echo "  -u, --uninstall Uninstall the Cluster only."
     echo "  -v, --version   Display the version of the script."
@@ -21,6 +24,9 @@ function help {
     echo "                  (also via the ASSUME_YES env var; --non-interactive is an alias)"
     echo "  -f, --force     Confirm destructive teardown (-u/-p) non-interactively."
     echo "                  Required for -u/-p under -y; never read from the environment."
+    echo "      --dry-run   Preview the install flow (-i/-n/-m): print the cluster-create and"
+    echo "                  helm commands without creating/installing anything."
+    echo "  -V, --verbose   Echo each external command (kind/helm/podman) before running it."
     echo
     echo "Short flags may be combined, e.g. -yi is the same as -y -i."
 }
@@ -178,6 +184,12 @@ ASSUME_YES="${ASSUME_YES:-}"
 # can't trigger an irreversible wipe. See confirm_destructive().
 FORCE=""
 
+# Flag-only modifiers (never read from the environment, so a stray env var can't silently
+# turn a real install into a no-op or change output): --dry-run previews the install flow
+# without running the side-effecting steps; -V/--verbose echoes external commands as run.
+DRY_RUN=""
+VERBOSE=""
+
 # Ask a yes/no question. $1=prompt, $2=default (y|n, default n). Returns 0 for yes.
 # In unattended mode (ASSUME_YES) it answers yes without prompting.
 function confirm {
@@ -282,6 +294,15 @@ function require_cmd {
     fi
 }
 
+# Run an external command, echoing it first under -V/--verbose. The echo goes to stderr
+# (so captured stdout stays clean) and shows the temp-values-file path, not credentials.
+# NB: named run_cmd, not run, to avoid clobbering bats-core's `run` when the test suite
+# sources this script.
+function run_cmd {
+    [[ -n "$VERBOSE" ]] && echo "+ $*" >&2
+    "$@"
+}
+
 # Pick a directory for direct binary installs: prefer a writable dir already on
 # PATH; otherwise fall back to /usr/local/bin (written via sudo).
 function install_bin_dir {
@@ -360,6 +381,11 @@ function verify_sha256 {
 
 # Check Dependencies
 function install_dependencies {
+    # --dry-run previews the install flow without side effects, so don't install anything.
+    if [[ -n "$DRY_RUN" ]]; then
+        echo "[dry-run] would install any missing dependencies (kind, kubectl, helm, jq, and a container runtime)." >&2
+        return 0
+    fi
 
     if command -v brew &>/dev/null; then
         echo "Installing Dependencies with Homebrew..."
@@ -699,6 +725,15 @@ function cluster_exists {
 }
 
 function init_cluster {
+    # --dry-run: preview the runtime prep + cluster create and touch nothing — no runtime
+    # setup, no Podman machine, no `kind create`. (Shows the pinned-default create command.)
+    if [[ -n "$DRY_RUN" ]]; then
+        local cn="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
+        echo "[dry-run] would prepare the container runtime, then run:" >&2
+        echo "[dry-run] would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image kindest/node:${KINDEST_NODE_VERSION}" >&2
+        return 0
+    fi
+
     # Choose and prepare the container runtime (Podman or Docker, both first-class).
     if ! select_runtime; then
         exit 1
@@ -731,7 +766,7 @@ function init_cluster {
                 ;;
             [Dd]*)
                 echo "Deleting existing cluster '${CLUSTER_NAME}'..."
-                kind delete cluster --name "${CLUSTER_NAME}"
+                run_cmd kind delete cluster --name "${CLUSTER_NAME}"
                 ;;
             *)
                 echo "Cancelling; leaving the existing cluster in place."
@@ -750,15 +785,15 @@ function init_cluster {
     fi
 
     if confirm "Create the cluster with the pinned Kubernetes version (kindest/node:${KINDEST_NODE_VERSION})?" y; then
-        kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "kindest/node:${KINDEST_NODE_VERSION}"
+        run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "kindest/node:${KINDEST_NODE_VERSION}"
     else
         node_image=$(select_node_image)
         if [[ -n "$node_image" ]]; then
             echo "Creating cluster '${CLUSTER_NAME}' with ${node_image}..."
-            kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "${node_image}"
+            run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "${node_image}"
         else
             echo "No version selected; using KinD's default node image."
-            kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config"
+            run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config"
         fi
     fi
 }
@@ -889,7 +924,10 @@ function install_sumo {
     # A values file is optional, but if one is named it must exist.
     [[ -n "$HELM_VALUES" ]] && require_values_file "$HELM_VALUES"
 
-    CLUSTER_NAME=$(ask "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
+    # Reuse an already-resolved CLUSTER_NAME as the default (e.g. set by reinstall) so the
+    # uninstall and reinstall target the same cluster; falls back to DEFAULT_CLUSTER_NAME
+    # for a direct -m/-i where it isn't pre-set (unchanged behavior there).
+    CLUSTER_NAME=$(ask "Name of the cluster [default=${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}]: " "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}")
 
     # Always ensure the repo is registered; the prompt only controls refreshing it.
     if confirm "Check for Helm repo updates?" n; then
@@ -918,13 +956,26 @@ sumologic:
 EOF
 
     # Build the helm args; only include the user values file when one is in use.
+    # Pin --kube-context to the named KinD cluster so a stray/wrong *current* kubectl
+    # context can't make this install/upgrade hit an unintended cluster.
     local helm_args=(upgrade --install sumologic sumologic/sumologic
         --version "$chart_version"
+        --kube-context "kind-${CLUSTER_NAME}"
         --namespace=sumologic --create-namespace)
     [[ -n "$HELM_VALUES" ]] && helm_args+=(--values "$HELM_VALUES")
     helm_args+=(--values "$secrets_file")
     helm_args+=(--set-string "sumologic.clusterName=${CLUSTER_NAME}")
     helm_args+=("${SUMO_COMMON_SET[@]}")
+
+    # --dry-run: show the assembled command (with helm's own --dry-run appended, the
+    # validating form) and stop — no wait prompt, no install, no next-steps. The shown
+    # --values path is the temp secrets file, so no credentials are echoed. (Args are
+    # space-joined for display; copy-paste needs quoting if a values path has spaces.)
+    if [[ -n "$DRY_RUN" ]]; then
+        echo "[dry-run] would run: helm ${helm_args[*]} --dry-run" >&2
+        echo "[dry-run] collector not installed; no changes made." >&2
+        return 0
+    fi
 
     # Optionally block until the collector pods are Ready (helm --wait). Default yes;
     # decline for a fire-and-forget install and check progress with -s/--status.
@@ -933,8 +984,8 @@ EOF
     fi
 
     # Guard the install so a failure (incl. a --wait timeout) gives an actionable hint
-    # rather than the generic ERR-trap message.
-    if ! helm "${helm_args[@]}"; then
+    # rather than the generic ERR-trap message. run_cmd echoes it first under --verbose.
+    if ! run_cmd helm "${helm_args[@]}"; then
         echo "Helm install did not complete cleanly (see the error above)." >&2
         echo "Inspect what's deployed:  $0 -s" >&2
         echo "Watch the pods:           kubectl get pods -n sumologic -w" >&2
@@ -951,6 +1002,43 @@ Next steps:
   Health check:         $0 -s
   Confirm data in Sumo: https://help.sumologic.com/docs/send-data/kubernetes/
 EOF
+}
+
+# Reinstall the collector: uninstall the existing `sumologic` Helm release, then run the
+# normal install (`helm upgrade --install`). For when an in-place upgrade (-m) is wedged.
+# The KinD cluster and Podman machine are left intact (use -u/-p to remove those).
+function reinstall {
+    require_cmd helm
+    echo "Reinstall removes the 'sumologic' Helm release and installs it fresh."
+    echo "The KinD cluster and Podman machine stay intact (use -u/-p to remove those)."
+    # Plain confirm() (honors -y) is intentional here, NOT confirm_destructive: a reinstall
+    # is recoverable (install_sumo runs immediately after, and the cluster/machine/stored
+    # credentials are untouched), unlike the irreversible wipes confirm_destructive guards.
+    if ! confirm "Uninstall and reinstall the sumologic collector?" n; then
+        echo "Cancelled; nothing changed."
+        exit 0
+    fi
+    # Resolve the cluster once and pin --kube-context so the uninstall and the reinstall
+    # target the SAME cluster and neither touches a stray current context. install_sumo
+    # (called below) reuses this CLUSTER_NAME as its prompt default.
+    CLUSTER_NAME=$(ask "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
+    local cluster_ctx="kind-${CLUSTER_NAME}"
+    # Only uninstall if a release is actually present, so a reinstall also works as a plain
+    # install after a partial/failed deploy. `exit 1` (not return) keeps a stuck-uninstall
+    # error from being doubled by the bare-dispatch ERR trap.
+    if helm --kube-context "$cluster_ctx" status sumologic --namespace sumologic >/dev/null 2>&1; then
+        echo "Uninstalling the existing 'sumologic' release..."
+        if ! run_cmd helm --kube-context "$cluster_ctx" uninstall sumologic --namespace sumologic; then
+            echo "Error: 'helm uninstall sumologic' failed. If a resource is stuck on a finaliser," >&2
+            echo "       see the finaliser-patch steps in examples/README.md, then re-run --reinstall." >&2
+            exit 1
+        fi
+    else
+        # helm status also exits non-zero when the cluster is unreachable, so hedge rather
+        # than assert "no release" — install_sumo surfaces a clear error if it can't connect.
+        echo "No active 'sumologic' release found (or the cluster is unreachable); proceeding to install."
+    fi
+    install_sumo
 }
 
 function output {
@@ -1012,6 +1100,8 @@ EOF
 
     # Mirror install_sumo's args so the rendered manifest matches what -i/-m deploys:
     # optional user values, then placeholder creds, clusterName, and the shared overrides.
+    # No --kube-context here (unlike install_sumo/reinstall): `helm template` renders
+    # offline and never contacts a cluster, so there is no current-context to pin against.
     local template_args=(template sumologic sumologic/sumologic
         --version "$chart_version"
         --namespace=sumologic --create-namespace)
@@ -1073,7 +1163,7 @@ function uninstall {
     echo "Caution: This will delete the cluster"
     confirm_destructive "delete the cluster"
     echo "Deleting Cluster: ${CLUSTER_NAME}"
-    kind delete cluster --name "${CLUSTER_NAME}"
+    run_cmd kind delete cluster --name "${CLUSTER_NAME}"
     if [[ "$CONTAINER_RUNTIME" == "podman" && "$OS" == "darwin" ]]; then
         echo "Leaving Podman machine intact (use --purge to remove it)."
     fi
@@ -1098,7 +1188,7 @@ function purge {
 
     confirm_destructive "delete the cluster and remove the Podman machine"
     echo "Deleting Cluster: ${CLUSTER_NAME}"
-    kind delete cluster --name "${CLUSTER_NAME}"
+    run_cmd kind delete cluster --name "${CLUSTER_NAME}"
     if [[ "$has_machine" == "yes" && -n "$running_machine" ]]; then
         echo "Stopping and Removing the - ${running_machine} - Podman Machine..."
         podman machine stop "${running_machine}"
@@ -1250,8 +1340,8 @@ function new_podman {
     stop_running_machine || return 1
 
     echo "Initializing Podman machine '$NAME' with ${MEMORY}MiB RAM..."
-    podman machine init --memory "${MEMORY}" "${NAME}"
-    podman machine start "${NAME}"
+    run_cmd podman machine init --memory "${MEMORY}" "${NAME}"
+    run_cmd podman machine start "${NAME}"
 }
 
 function use_existing_podman {
@@ -1358,7 +1448,7 @@ function use_existing_podman {
             echo "Machine '$chosen_machine' is not running."
             if confirm "Start it now?" n; then
                 echo "Starting Podman machine '$chosen_machine'..."
-                podman machine start "$chosen_machine"
+                run_cmd podman machine start "$chosen_machine"
             else
                 echo "Exiting without starting machine."
                 return 1
@@ -1394,6 +1484,60 @@ function set_action {
         conflict="yes"
     fi
     action="$1"
+}
+
+# Print the Sumo Logic collection endpoints from the in-cluster `sumologic` secret,
+# base64-decoded (the secret stores one `endpoint-*` key per signal). Read-only; requires
+# kubectl + jq and a reachable cluster. Uses the script's conventions (namespace sumologic,
+# kind-<cluster> context).
+function endpoints {
+    require_cmd kubectl jq
+    local cluster_name secret_json
+    cluster_name=$(ask "Cluster name [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
+    if ! secret_json=$(kubectl --context "kind-${cluster_name}" -n sumologic get secret sumologic -o json 2>/dev/null); then
+        echo "Error: could not read the 'sumologic' secret (cluster unreachable, or the collector isn't installed)." >&2
+        exit 1
+    fi
+    echo "Sumo Logic collection endpoints (namespace sumologic):"
+    # Stream through jq in the `if` condition (errexit-exempt) so a jq failure — e.g. a
+    # value that isn't valid base64 — is reported cleanly here, rather than firing the ERR
+    # trap inside a command-substitution subshell (where the pipeline wouldn't be exempt).
+    # jq emits the "none found" line itself when there are no endpoint-* keys.
+    if ! printf '%s' "$secret_json" | jq -r '
+        (.data // {} | to_entries | map(select(.key | startswith("endpoint-")))) as $eps
+        | if ($eps | length) == 0 then "  (no endpoint-* keys found)"
+          else $eps[] | "  \(.key) = \(.value | @base64d)" end'; then
+        echo "Error: could not decode the secret's endpoint values (a value was not valid base64?)." >&2
+        exit 1
+    fi
+}
+
+# Port-forward the TRACES collector's OTLP receiver to localhost so local apps can send
+# OTLP traces to the cluster. The script installs with fullnameOverride=sumo, so the
+# traces collector service is svc/sumo-otelcol, exposing 4317 (gRPC) + 4318 (HTTP).
+# Blocks until Ctrl-C. Requires kubectl + a reachable cluster.
+function forward {
+    require_cmd kubectl
+    local cluster_name cluster_ctx rc
+    cluster_name=$(ask "Cluster name [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
+    cluster_ctx="kind-${cluster_name}"
+    if ! kubectl --context "$cluster_ctx" -n sumologic get svc sumo-otelcol >/dev/null 2>&1; then
+        echo "Error: svc/sumo-otelcol not found in namespace sumologic (is the collector installed and the cluster reachable?)." >&2
+        exit 1
+    fi
+    echo "Forwarding the traces collector (svc/sumo-otelcol) OTLP -> localhost:4317 (gRPC) and :4318 (HTTP)." >&2
+    echo "Point an OTLP trace exporter at localhost:4317 or :4318. Press Ctrl-C to stop." >&2
+    # port-forward blocks until Ctrl-C, which delivers SIGINT and makes kubectl exit 130.
+    # Treat that (and a clean 0) as a normal stop, so it doesn't trip the ERR trap with a
+    # misleading "command failed / nothing changed" teardown message.
+    rc=0
+    kubectl --context "$cluster_ctx" -n sumologic port-forward svc/sumo-otelcol 4317:4317 4318:4318 || rc=$?
+    if [[ "$rc" -eq 0 || "$rc" -eq 130 ]]; then
+        echo "Stopped port-forwarding." >&2
+        return 0
+    fi
+    echo "Error: port-forward exited unexpectedly (exit ${rc})." >&2
+    exit 1
 }
 
 # Entry point. Enabling strict mode and the ERR trap here (rather than at the top
@@ -1435,14 +1579,19 @@ function main {
             -i | --install) set_action install ;;
             -n | --init) set_action init ;;
             -m | --helm) set_action helm ;;
+            -r | --reinstall) set_action reinstall ;;
             -o | --output) set_action output ;;
             -s | --status) set_action status ;;
+            -e | --endpoints) set_action endpoints ;;
+            --forward) set_action forward ;;
             -p | --purge) set_action purge ;;
             -u | --uninstall) set_action uninstall ;;
             -v | --version) set_action version ;;
             # Modifiers (not actions): order-independent, may appear before or after.
             -y | --yes | --non-interactive) ASSUME_YES="yes" ;;
             -f | --force) FORCE="yes" ;;
+            --dry-run) DRY_RUN="yes" ;;
+            -V | --verbose) VERBOSE="yes" ;;
             *) if [[ -z "$bad_flag" ]]; then bad_flag="$1"; fi ;;
         esac
         shift
@@ -1461,8 +1610,15 @@ function main {
     fi
 
     if [[ -n "$conflict" ]]; then
-        echo "Specify exactly one action (-i/-n/-m/-o/-s/-p/-u/-v)." >&2
+        echo "Specify exactly one action (-i/-n/-m/-r/-o/-s/-e/--forward/-p/-u/-v)." >&2
         help >&2
+        exit 1
+    fi
+
+    # --dry-run only previews the install flow. Refuse it for other actions rather than
+    # silently ignoring it — otherwise e.g. `--dry-run -u` would still delete the cluster.
+    if [[ -n "$DRY_RUN" && "$action" != "install" && "$action" != "init" && "$action" != "helm" ]]; then
+        echo "Error: --dry-run only applies to the install flow (-i/-n/-m)." >&2
         exit 1
     fi
 
@@ -1477,13 +1633,16 @@ function main {
             init_cluster
             ;;
         helm) install_sumo ;;
+        reinstall) reinstall ;;
         output) output ;;
         status) status ;;
+        endpoints) endpoints ;;
+        forward) forward ;;
         purge) purge ;;
         uninstall) uninstall ;;
         version) version ;;
         *)
-            echo "Specify exactly one action (-i/-n/-m/-o/-s/-p/-u/-v), or -h for help." >&2
+            echo "Specify exactly one action (-i/-n/-m/-r/-o/-s/-e/--forward/-p/-u/-v), or -h for help." >&2
             help >&2
             exit 1
             ;;

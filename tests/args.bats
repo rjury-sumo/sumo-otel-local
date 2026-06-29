@@ -13,7 +13,9 @@ setup() {
 STUBS='install_dependencies(){ echo "DEPS_RAN"; }; init_cluster(){ echo "INIT_RAN"; }
        install_sumo(){ echo "SUMO_RAN y=$ASSUME_YES f=$FORCE"; }
        output(){ echo "OUTPUT_RAN"; }; purge(){ echo "PURGE_RAN f=$FORCE"; }
-       uninstall(){ echo "UNINSTALL_RAN f=$FORCE"; }; status(){ echo "STATUS_RAN"; }'
+       uninstall(){ echo "UNINSTALL_RAN f=$FORCE"; }; status(){ echo "STATUS_RAN"; }
+       endpoints(){ echo "ENDPOINTS_RAN"; }; forward(){ echo "FORWARD_RAN"; }
+       reinstall(){ echo "REINSTALL_RAN"; }'
 
 # run_main <args...> : source the script, install stubs, then run main with the args.
 run_main() {
@@ -32,6 +34,33 @@ run_main() {
     run_main -s
     [ "$status" -eq 0 ]
     [[ "$output" == *"STATUS_RAN"* ]]
+}
+
+@test "-r/--reinstall dispatches the reinstall action" {
+    run_main -r
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"REINSTALL_RAN"* ]]
+    run_main --reinstall
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"REINSTALL_RAN"* ]]
+}
+
+@test "-e/--endpoints and --forward dispatch their actions" {
+    run_main -e
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ENDPOINTS_RAN"* ]]
+    run_main --endpoints
+    [[ "$output" == *"ENDPOINTS_RAN"* ]]
+    run_main --forward
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"FORWARD_RAN"* ]]
+}
+
+@test "-e and --forward are still single actions (conflict with another action errors)" {
+    run_main -e -i
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Specify exactly one action"* ]]
+    [[ "$output" != *"ENDPOINTS_RAN"* ]]
 }
 
 @test "-n dispatches init only (no install_sumo)" {
@@ -106,6 +135,27 @@ run_main() {
     run_main -p --force
     [ "$status" -eq 0 ]
     [[ "$output" == *"PURGE_RAN f=yes"* ]]
+}
+
+@test "--dry-run and -V/--verbose are modifiers, combinable with an install-flow action" {
+    run_main --dry-run -n
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"INIT_RAN"* ]]
+    run_main -V -i
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SUMO_RAN"* ]]
+}
+
+@test "--dry-run is refused for EVERY non-install action (the only guard against e.g. --dry-run -u deleting)" {
+    # The guard is the sole thing stopping --dry-run -u/-p from running a real teardown
+    # (uninstall/purge don't honor DRY_RUN), so pin the refusal for all of them. Failures
+    # accumulate into $bad; the load-bearing assertion is last (robust on macOS + Linux bats).
+    local act bad=""
+    for act in -u -p -r -o -s --forward; do
+        run_main --dry-run "$act"
+        { [ "$status" -eq 1 ] && [[ "$output" == *"only applies to the install flow"* ]] && [[ "$output" != *_RAN* ]]; } || bad="$bad $act"
+    done
+    [ -z "$bad" ] # every non-install action refused --dry-run before dispatching
 }
 
 @test "long flags and aliases work (--non-interactive --install)" {

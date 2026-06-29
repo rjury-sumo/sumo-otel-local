@@ -85,6 +85,7 @@ setup() {
     [[ "$output" == *"fullnameOverride=sumo"* ]]
     [[ "$output" == *"sumologic.falco.enabled=false"* ]]
     [[ "$output" == *"sumologic.logs.systemd.enabled=false"* ]]
+    [[ "$output" == *"--kube-context kind-sumo"* ]] # pinned to the named KinD cluster, not the current context
 }
 
 @test "install_sumo: credentials never appear on the helm command line" {
@@ -118,6 +119,95 @@ setup() {
     [[ "$output" != *"TRAP_FIRED"* ]]
     [[ "$output" == *"did not complete"* ]]
     [[ "$output" != *"Next steps"* ]]
+}
+
+# --- --dry-run / --verbose (install flow) -----------------------------------
+
+@test "install_sumo --dry-run: previews the helm command and installs nothing" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; ensure_helm_repo(){ :;}; secret_get(){ printf S;}; select_chart_version(){ printf 5.2.0;}
+        helm(){ echo HELM_RAN; }; DRY_RUN=yes; ASSUME_YES=yes; install_sumo' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] would run: helm upgrade --install"* ]]
+    [[ "$output" == *"--dry-run"* ]]  # helm's own dry-run appended to the previewed command
+    [[ "$output" != *"Next steps"* ]] # success path skipped
+    [[ "$output" != *"HELM_RAN"* ]]   # real helm never executed (asserted last)
+}
+
+@test "install_sumo --verbose: echoes the helm command before running it" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; ensure_helm_repo(){ :;}; secret_get(){ printf S;}; select_chart_version(){ printf 5.2.0;}
+        helm(){ echo HELM_RAN; }; VERBOSE=yes; ASSUME_YES=yes; install_sumo' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"+ helm upgrade --install"* ]] # echoed
+    [[ "$output" == *"HELM_RAN"* ]]                 # and actually run
+}
+
+@test "init_cluster --dry-run: previews the kind create without touching the runtime or creating a cluster" {
+    # No runtime stubs on purpose: the dry-run early-return must skip select_runtime /
+    # ensure_*_ready entirely. If it regressed, the REAL select_runtime would run here.
+    run bash -c 'source "$1"; kind(){ echo "KIND_RAN $*"; }; DRY_RUN=yes; ASSUME_YES=yes; init_cluster' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"KIND_RAN"* ]] # no real cluster created
+    [[ "$output" == *"[dry-run] would run: kind create"* ]] # previewed (asserted last)
+}
+
+@test "uninstall --verbose echoes the kind delete before running it" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; select_runtime(){ CONTAINER_RUNTIME=docker; return 0; }; set_kind_provider(){ :; }
+        kind(){ echo KIND_RAN; }; VERBOSE=yes; FORCE=yes; uninstall' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"KIND_RAN"* ]]                          # real delete still runs
+    [[ "$output" == *"+ kind delete cluster --name sumo"* ]] # ...and is echoed under --verbose
+}
+
+# --- reinstall (uninstall the release, then install_sumo) -------------------
+
+@test "reinstall: declining the confirm aborts without uninstalling or installing" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; install_sumo(){ echo INSTALL_RAN; }
+        confirm(){ return 1; }; helm(){ echo "HELM $*"; }
+        ASSUME_YES=""; reinstall </dev/null' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Cancelled"* ]]
+    [[ "$output" != *"HELM"* ]]        # no helm status/uninstall ran
+    [[ "$output" != *"INSTALL_RAN"* ]]
+}
+
+@test "reinstall: the real confirm defaults to NO on EOF (drives confirm, not a stub)" {
+    # Exercises the real `confirm "..." n`: closed stdin + no -y -> default no -> cancel.
+    # The stubbed test above can't catch a default-no -> default-yes regression.
+    run bash -c 'source "$1"; require_cmd(){ :;}; install_sumo(){ echo INSTALL_RAN; }
+        helm(){ echo "HELM $*"; }; ASSUME_YES=""; reinstall </dev/null' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"INSTALL_RAN"* ]] # default-no path: never reinstalls
+    [[ "$output" != *"HELM"* ]]
+}
+
+@test "reinstall: an existing release is uninstalled (context-pinned), then install_sumo runs" {
+    # Match on $* (not $1) since the call is now `helm --kube-context kind-<c> uninstall ...`.
+    run bash -c 'source "$1"; require_cmd(){ :;}; install_sumo(){ echo INSTALL_RAN; }
+        helm(){ case "$*" in *"status sumologic"*) return 0;; *"uninstall sumologic"*) echo "UNINST $*";; esac; }
+        ASSUME_YES=yes; reinstall' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"UNINST --kube-context kind-sumo uninstall sumologic"* ]] # uninstall pins the context
+    [[ "$output" == *"INSTALL_RAN"* ]]
+}
+
+@test "reinstall: a stuck uninstall errors with the finalizer hint and skips reinstall" {
+    run bash -c 'source "$1"; set -Eeuo pipefail; trap "echo ERR_TRAP" ERR; require_cmd(){ :;}; install_sumo(){ echo INSTALL_RAN; }
+        helm(){ case "$*" in *"status sumologic"*) return 0;; *"uninstall sumologic"*) return 1;; esac; }
+        ASSUME_YES=yes; reinstall' _ "$SCRIPT"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"finaliser"* ]]   # matches examples/README.md's "## Finalisers" (UK spelling)
+    [[ "$output" != *"ERR_TRAP"* ]]    # exit 1 (not return 1) -> no bare-dispatch on_error
+    [[ "$output" != *"INSTALL_RAN"* ]] # reinstall skipped after the failed uninstall
+}
+
+@test "reinstall: no existing release proceeds straight to a fresh install" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; install_sumo(){ echo INSTALL_RAN; }
+        helm(){ case "$*" in *"status sumologic"*) return 1;; *"uninstall sumologic"*) echo "UNINST $*";; esac; }
+        ASSUME_YES=yes; reinstall' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"UNINST"* ]]       # nothing to uninstall
+    [[ "$output" == *"INSTALL_RAN"* ]]  # proceeded to a fresh install
+    [[ "$output" == *"No active"* ]]    # the hedged "no release / maybe unreachable" message (asserted last)
 }
 
 # NB: helm's stdout is piped into `| tee`, so a `helm(){ echo MARKER;}` stub's output
@@ -368,6 +458,67 @@ run_status() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"STATUS: deployed"* ]]
     [[ "$output" == *"Running"* ]]
+}
+
+# --- endpoints / forward (read-only kubectl helpers) ------------------------
+
+@test "endpoints: decodes the secret's endpoint-* keys and filters the rest" {
+    local b64; b64=$(printf 'https://logs.example' | base64)
+    run bash -c 'source "$1"; b="$2"; require_cmd(){ :;}
+        kubectl(){ printf "{\"data\":{\"endpoint-logs\":\"%s\",\"version\":\"eA==\"}}" "$b"; }
+        ASSUME_YES=yes; endpoints' _ "$SCRIPT" "$b64"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"version"* ]]                              # non-endpoint key filtered out
+    [[ "$output" == *"endpoint-logs = https://logs.example"* ]] # decoded (load-bearing: asserted last)
+}
+
+@test "endpoints: errors clearly when the sumologic secret can't be read" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; kubectl(){ return 1; }; ASSUME_YES=yes; endpoints' _ "$SCRIPT"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not read the 'sumologic' secret"* ]]
+}
+
+@test "endpoints: a non-base64 secret value fails cleanly (exit 1, no ERR trap)" {
+    run bash -c 'source "$1"; set -Eeuo pipefail; trap "echo ERR_TRAP" ERR; require_cmd(){ :;}
+        kubectl(){ printf "{\"data\":{\"endpoint-logs\":\"!!notbase64!!\"}}"; }
+        ASSUME_YES=yes; endpoints' _ "$SCRIPT"
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"ERR_TRAP"* ]] # exit 1 (not return 1) avoids the bare-dispatch on_error
+    [[ "$output" == *"could not decode"* ]]
+}
+
+@test "forward: errors (no port-forward) when svc/sumo-otelcol is absent" {
+    run bash -c 'source "$1"; require_cmd(){ :;}
+        kubectl(){ case "$*" in *"get svc"*) return 1;; *) echo "PF $*";; esac; }
+        ASSUME_YES=yes; forward' _ "$SCRIPT"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"sumo-otelcol not found"* ]]
+    [[ "$output" != *"port-forward"* ]] # never reached the blocking port-forward
+}
+
+@test "forward: port-forwards svc/sumo-otelcol on 4317 + 4318 when present" {
+    run bash -c 'source "$1"; require_cmd(){ :;}
+        kubectl(){ case "$*" in *"get svc"*) return 0;; *) echo "PF $*";; esac; }
+        ASSUME_YES=yes; forward' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"port-forward svc/sumo-otelcol 4317:4317 4318:4318"* ]]
+}
+
+@test "forward: a Ctrl-C stop (kubectl exit 130) is clean, not an ERR-trap failure" {
+    run bash -c 'source "$1"; set -Eeuo pipefail; trap "echo ERR_TRAP" ERR; require_cmd(){ :;}
+        kubectl(){ case "$*" in *"get svc"*) return 0;; *"port-forward"*) return 130;; *) :;; esac; }
+        ASSUME_YES=yes; forward' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"ERR_TRAP"* ]] # SIGINT/130 treated as a clean stop
+    [[ "$output" == *"Stopped port-forwarding"* ]]
+}
+
+@test "endpoints: reports '(no endpoint-* keys found)' when the secret has none" {
+    run bash -c 'source "$1"; require_cmd(){ :;}
+        kubectl(){ printf "{\"data\":{\"version\":\"eA==\"}}"; }
+        ASSUME_YES=yes; endpoints' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no endpoint-* keys found"* ]]
 }
 
 # --- error handling (errtrace) ----------------------------------------------

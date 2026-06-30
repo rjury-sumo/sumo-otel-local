@@ -120,6 +120,32 @@ setup() {
     [[ "$output" == *"--kube-context kind-sumo"* && "$output" == *"values.yaml --values "* ]]
 }
 
+@test "install_sumo: interactive prompt order is stable (values -> cluster -> repo-update -> wait)" {
+    # Pins the confirm/ask call ORDER + COUNT so reordering, adding, or dropping a prompt is
+    # caught (the testing-seam finding's option-(a) deliverable). The stubs map prompt
+    # substring -> a short tag recorded to a marker FILE (survives the $(...) subshells `ask`
+    # runs in); any unmapped prompt records "UNEXPECTED-…" and breaks the exact match.
+    local rec="${BATS_TEST_TMPDIR}/prompts"
+    run bash -c 'source "$1"; rec="$2"; trap - ERR EXIT
+        secret_get(){ printf STORED; }     # creds already stored -> no read_secret prompts
+        require_values_file(){ :; }; ensure_helm_repo(){ :; }; select_chart_version(){ printf 5.2.0; }; helm(){ :; }
+        ask(){ case "$1" in
+                 *"Helm values file"*)    echo values  >>"$rec";;
+                 *"Name of the cluster"*) echo cluster >>"$rec";;
+                 *) echo "UNEXPECTED-ASK[$1]" >>"$rec";;
+               esac; printf "%s" "$2"; }
+        confirm(){ case "$1" in
+                     *"repo updates"*)           echo repo-update >>"$rec";;
+                     *"Wait for the collector"*) echo wait        >>"$rec";;
+                     *) echo "UNEXPECTED-CONFIRM[$1]" >>"$rec";;
+                   esac; return 0; }
+        install_sumo >/dev/null 2>&1; rc=$?
+        paste -sd" " "$rec"        # one-line ordered signature of the prompts
+        exit $rc' _ "$SCRIPT" "$rec"
+    # Exact ordered sequence (and count) of the four prompts, asserted as one last command.
+    [ "$status" -eq 0 ] && [ "$output" = "values cluster repo-update wait" ]
+}
+
 @test "install_sumo: credentials never appear on the helm command line" {
     run bash -c 'source "$1"; require_cmd(){ :;}; ensure_helm_repo(){ :;}; secret_get(){ printf SECRETVALUE;}
         helm(){ printf "HELM %s\n" "$*"; }; ASSUME_YES=yes; install_sumo' _ "$SCRIPT"
@@ -178,8 +204,21 @@ setup() {
     # ensure_*_ready entirely. If it regressed, the REAL select_runtime would run here.
     run bash -c 'source "$1"; kind(){ echo "KIND_RAN $*"; }; DRY_RUN=yes; ASSUME_YES=yes; init_cluster' _ "$SCRIPT"
     [ "$status" -eq 0 ]
-    [[ "$output" != *"KIND_RAN"* ]] # no real cluster created
-    [[ "$output" == *"[dry-run] would run: kind create"* ]] # previewed (asserted last)
+    # No real cluster created AND the preview shows the digest-pinned node image (combined so
+    # both are load-bearing on macOS bats).
+    [[ "$output" != *"KIND_RAN"* ]] \
+        && [[ "$output" == *"[dry-run] would run: kind create"*"--image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"* ]]
+}
+
+@test "init_cluster: the default-yes create uses the digest-pinned node image" {
+    run bash -c 'source "$1"; trap - ERR EXIT
+        select_runtime(){ CONTAINER_RUNTIME=docker; return 0; }
+        set_kind_provider(){ :; }; ensure_docker_ready(){ :; }
+        cluster_exists(){ return 1; }        # no existing cluster -> straight to create
+        kind(){ echo "kind $*"; }            # capture the create argv
+        ASSUME_YES=yes; init_cluster' _ "$SCRIPT"
+    [ "$status" -eq 0 ] \
+        && [[ "$output" == *"kind create cluster --name sumo --config"*"--image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"* ]]
 }
 
 @test "uninstall --verbose echoes the kind delete before running it" {
@@ -904,4 +943,48 @@ CHART_STUB='helm(){ printf "%s\n" "NAME CHART_VERSION APP_VERSION DESC" "sumolog
     # filenames directly in /tmp, not the /tmp prefix.
     refute_called 'install_binary /tmp/(jq|kubectl|kind)$'
     [[ "$output" == *"SCRATCH_GONE"* ]]
+}
+
+@test "install_dependencies: no-brew path fails fast with a clear message when curl is missing" {
+    run bash -c '
+        source "$1"; trap - ERR EXIT
+        confirm() { return 1; }              # would pick direct-download, but the curl guard fires first
+        command() {
+            if [ "$1" = "-v" ]; then
+                case "$2" in
+                    brew|curl) return 1 ;;       # no Homebrew, and no curl on PATH
+                    *) builtin command "$@" ;;
+                esac
+            else builtin command "$@"; fi
+        }
+        install_dependencies
+    ' _ "$SCRIPT"
+    # The standard require_cmd message, not a raw "curl: command not found" under the ERR trap.
+    [[ "$output" == *"required command(s) not found: curl"* ]] && [ "$status" -ne 0 ]
+}
+
+@test "install_dependencies: no-brew direct path guards curl, tar (helm), and unzip (macOS Podman)" {
+    run bash -c '
+        source "$1"; trap - ERR EXIT
+        scratch="$2"; calls="$3"
+        OS=darwin; ARCH=arm64                  # force the macOS Podman (.zip) branch even on Linux CI
+        confirm() { return 1; }                # decline Homebrew -> direct-download path
+        command() {
+            if [ "$1" = "-v" ]; then
+                case "$2" in
+                    brew|jq|kubectl|helm|kind|docker|podman) return 1 ;;  # all absent -> every block runs
+                    *) builtin command "$@" ;;
+                esac
+            else builtin command "$@"; fi
+        }
+        # Record require_cmd targets (instead of enforcing) so the whole path runs.
+        require_cmd() { local c; for c in "$@"; do echo "require_cmd $c" >>"$calls"; done; }
+        mktemp() { mkdir -p "$scratch"; printf "%s\n" "$scratch"; }
+        curl() { local out="" prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done; [ -n "$out" ] && : >"$out"; return 0; }
+        verify_sha256() { :; }; remote_sha256() { echo deadbeef; }
+        tar() { :; }; unzip() { :; }; kubectl() { :; }; install_binary() { :; }
+        install_dependencies
+    ' _ "$SCRIPT" "$BATS_TEST_TMPDIR/scratch" "$CALLS"
+    # All three guards fire on the macOS no-runtime path (chained -> each load-bearing on macOS bats).
+    assert_called "^require_cmd curl$" && assert_called "^require_cmd tar$" && assert_called "^require_cmd unzip$"
 }

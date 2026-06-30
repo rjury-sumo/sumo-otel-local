@@ -136,14 +136,23 @@ KIND_VERSION="${KIND_VERSION:-v0.32.0}"
 # renovate: datasource=github-releases depName=containers/podman
 PODMAN_VERSION="${PODMAN_VERSION:-v6.0.0}"
 
-# Pinned kindest/node image — the Kubernetes version the KinD cluster runs. This is the
+# Pinned kindest/node image — the Kubernetes version the KinD cluster runs. v1.36.1 is the
 # default node image that kind ${KIND_VERSION} ships and tests with, so it pairs with the
 # pinned kind and renders/validates against the pinned chart. Used as the default in
 # init_cluster; select_node_image still lets you pick another version interactively.
-# Deliberately NOT Renovate-annotated: the node image is coupled to KIND_VERSION (it must
-# fall in kind's supported range), so bump it together with kind, not independently.
-# Known-good digest (kind v0.32.0 default): sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+# DIGEST-pinned, not just the tag: a Docker tag can be re-pushed but the digest can't, so
+# pinning the sha256 makes the node image reproducible. v1.36.1@sha256:3489… is kind
+# v0.32.0's default per its release notes (verified against Docker Hub). Bump the version
+# and digest TOGETHER from the kind release notes. Deliberately NOT Renovate-annotated: the
+# node image is coupled to KIND_VERSION, so bump it with kind, not independently. To run a
+# different/unpinned version, override KINDEST_NODE_VERSION and clear KINDEST_NODE_DIGEST
+# (`KINDEST_NODE_DIGEST=`), which falls back to a tag-only ref.
 KINDEST_NODE_VERSION="${KINDEST_NODE_VERSION:-v1.36.1}"
+# Note: `-` (not `:-`) so an explicitly-empty `KINDEST_NODE_DIGEST=` opts out to a tag-only
+# ref (rather than re-applying this default, which would mismatch an overridden version).
+KINDEST_NODE_DIGEST="${KINDEST_NODE_DIGEST-sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5}"
+# Full image ref: tag + digest when a digest is set, else tag only (graceful override).
+KINDEST_NODE_IMAGE="kindest/node:${KINDEST_NODE_VERSION}${KINDEST_NODE_DIGEST:+@${KINDEST_NODE_DIGEST}}"
 
 # Homebrew bootstrap installer, pinned to a specific commit (not mutable HEAD) and
 # verified against this SHA-256 before it is made executable and run, so --install/--init
@@ -411,6 +420,11 @@ function install_dependencies {
         fi
         brew install --quiet "${brew_pkgs[@]}"
     elif ! command -v brew &>/dev/null; then
+        # Both branches below fetch over the network with curl (the Homebrew installer
+        # download, and every direct-download). Fail fast with the standard clear message
+        # if curl is missing (e.g. a minimal Linux image) instead of a raw
+        # 'curl: command not found' under the ERR trap.
+        require_cmd curl
         if confirm "Homebrew is not installed. Install it?" n; then
             # Run a PINNED, checksum-verified copy of the Homebrew installer rather than
             # piping mutable HEAD straight into a shell. Surface the exact source so the
@@ -455,6 +469,7 @@ function install_dependencies {
 
             if ! command -v helm &>/dev/null; then
                 echo "Installing Helm ${HELM_VERSION}..."
+                require_cmd tar # the pinned release tarball is extracted with tar below
                 # Download the pinned helm release tarball directly and verify its
                 # published SHA-256 before extracting — avoids executing the get-helm-3
                 # bootstrap script from a mutable master ref. Tarball lays out as
@@ -470,6 +485,7 @@ function install_dependencies {
             if ! command -v docker &>/dev/null && ! command -v podman &>/dev/null; then
                 echo "Installing Podman ${PODMAN_VERSION}..."
                 if [[ "$OS" == "darwin" ]]; then
+                    require_cmd unzip # the darwin release ships as a .zip, extracted below
                     # The release tag carries a leading 'v' (used in the URL); the zip's
                     # internal directory does not (podman-6.0.0/, not podman-v6.0.0/).
                     ver="${PODMAN_VERSION#v}"
@@ -952,7 +968,7 @@ function init_cluster {
     if [[ -n "$DRY_RUN" ]]; then
         local cn="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
         echo "[dry-run] would prepare the container runtime, then run:" >&2
-        echo "[dry-run] would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image kindest/node:${KINDEST_NODE_VERSION}" >&2
+        echo "[dry-run] would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image ${KINDEST_NODE_IMAGE}" >&2
         return 0
     fi
 
@@ -1009,7 +1025,7 @@ function init_cluster {
     fi
 
     if confirm "Create the cluster with the pinned Kubernetes version (kindest/node:${KINDEST_NODE_VERSION})?" y; then
-        run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "kindest/node:${KINDEST_NODE_VERSION}"
+        run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config" --image "${KINDEST_NODE_IMAGE}"
     else
         node_image=$(select_node_image)
         if [[ -n "$node_image" ]]; then

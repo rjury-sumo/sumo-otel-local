@@ -18,7 +18,9 @@ asks which to use; otherwise it uses whichever is present.
 - **A container runtime: Docker or Podman.** If neither is installed, `--install` /
   `--init` will offer to install Podman (via Homebrew on macOS, or with guidance on
   Linux).
-- **macOS:** [Homebrew](https://brew.sh/) — used to install the remaining tools.
+- **macOS:** [Homebrew](https://brew.sh/) — used to install the remaining tools. If you
+  decline Homebrew, the direct-download fallback needs `curl`, `tar`, and `unzip` (all
+  ship with macOS; the Podman release is a `.zip`).
 - **Linux:** `curl` and `tar` — the script downloads the remaining tools directly.
 - Remaining CLIs (`kind`, `kubectl`, `helm`, `jq`) are installed for you by
   `--install` / `--init` if they are missing.
@@ -194,8 +196,11 @@ cluster with the **same `kind` + `kindest/node`** (so render/dry-run match what 
 deploy), and [Renovate](#contributing) keeps these pins current via annotations next to
 each constant. `KINDEST_NODE_VERSION` is the default node image kind `v0.32.0` ships and
 tests with, so it's coupled to `KIND_VERSION` (bump them together) — that's why it isn't
-Renovate-tracked. You can still pick another version interactively — see
-[Kubernetes version](#kubernetes-version).
+Renovate-tracked. The node image is **digest-pinned** (`kindest/node:v1.36.1@sha256:…`, the
+digest from kind's release notes) so a re-pushed tag can't change what runs; to use a
+different version, override `KINDEST_NODE_VERSION` and either set `KINDEST_NODE_DIGEST` to
+the matching digest or clear it (`KINDEST_NODE_DIGEST=`) for a tag-only ref. You can also
+pick another version interactively — see [Kubernetes version](#kubernetes-version).
 
 ### Project config file
 

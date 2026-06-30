@@ -4,7 +4,7 @@
 # level, so the script can be safely `source`d by the test suite (tests/) to exercise
 # individual functions without running the CLI, enabling errexit, or installing traps.
 
-# Helper Functions
+# --- Usage --------------------------------------------------------------------
 function help {
     echo "Usage: $0 [options]"
     echo "Options:"
@@ -161,7 +161,19 @@ VERSION="0.5.0" # x-release-please-version
 # Default KinD cluster name, used by create and teardown. Honors a CLUSTER_NAME set in
 # the environment / config file, so every name prompt (which defaults to this) and the
 # teardown/status flows pick it up.
+#
+# CLUSTER_NAME (the runtime value, not this default) is intentionally a SHARED global, not
+# a per-function local: confirm_destructive sets it for uninstall/purge to read, and
+# init_cluster/reinstall set it for install_sumo to reuse so the install targets the same
+# cluster (see install_sumo's `${CLUSTER_NAME:-...}` prompt default). HELM_VALUES is
+# likewise a config/env knob read by install_sumo and output. Don't localise either.
 DEFAULT_CLUSTER_NAME="${CLUSTER_NAME:-sumo}"
+
+# Bundled default Helm values file and the default -o/--output render path. Constants
+# (hoisted from install_sumo/output, where they were duplicated string literals); both
+# flows reference them read-only.
+DEFAULT_HELM_VALUES="$SCRIPT_DIR/values.yaml"
+DEFAULT_K8S_YAML="sumologic-rendered.yaml"
 
 # Chart overrides applied to EVERY install and render, so `-o`/--output mirrors what
 # `-i`/`-m` deploys. Single source of truth: both install_sumo and output append this,
@@ -719,6 +731,216 @@ function ensure_docker_ready {
     return 0
 }
 
+# --- Podman machine helpers (macOS; used by ensure_podman_ready above) -------
+
+# Normalize a `podman machine` Memory value to MiB. Podman has reported this field
+# in bytes (5.x) and in MiB (older versions); decide by magnitude. Any real machine
+# has >= 1 GiB, so a value at/above 1 GiB-in-bytes is bytes, otherwise it's MiB.
+function mem_to_mib {
+    local raw=$1
+    [[ "$raw" =~ ^[0-9]+$ ]] || {
+        echo 0
+        return 0
+    }
+    if [[ "$raw" -ge 1073741824 ]]; then
+        echo $((raw / 1024 / 1024))
+    else
+        echo "$raw"
+    fi
+}
+
+# Only one Podman machine can run at a time. If one is running, offer to stop it.
+# Returns 0 if nothing is running or it was stopped, 1 if the user declines.
+function stop_running_machine {
+    local running_machine
+    running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
+    [[ -z "$running_machine" ]] && return 0
+    echo "Podman machine '$running_machine' is currently running (only one can run at a time)."
+    if confirm "Stop it before continuing?" n; then
+        echo "Stopping '$running_machine'..."
+        podman machine stop "$running_machine"
+        return 0
+    fi
+    echo "Cannot proceed while another machine is running."
+    return 1
+}
+
+function new_podman {
+    local DEFAULT_NAME DEFAULT_MEMORY MEMORY NAME # all new_podman-local
+    echo "Creating a new Podman machine..."
+    DEFAULT_NAME="sumo"
+    DEFAULT_MEMORY="${MIN_MEM_MB}" # default a new machine to the configured minimum
+    MEMORY=$(ask "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " "$DEFAULT_MEMORY")
+    # Validate before handing it to `podman machine init --memory`, which otherwise fails
+    # cryptically on non-numeric input. Reject non-integers hard; warn (don't block) when
+    # below the minimum, matching check_docker_resources' tone for a deliberate choice.
+    if ! [[ "$MEMORY" =~ ^[0-9]+$ ]]; then
+        echo "Error: memory must be a positive integer (MiB), got '${MEMORY}'." >&2
+        return 1
+    fi
+    MEMORY=$((10#$MEMORY)) # normalize: strip leading zeros so the comparison isn't read as octal
+    if [[ "$MEMORY" -lt "$MIN_MEM_MB" ]]; then
+        echo "⚠️  ${MEMORY}MiB is below the recommended minimum (${MIN_MEM_MB}MiB); the Sumo stack may be unstable." >&2
+    fi
+    NAME=$(ask "Name of the Podman machine [default=${DEFAULT_NAME}]: " "$DEFAULT_NAME")
+
+    # Free the single run slot before creating/starting the new machine.
+    stop_running_machine || return 1
+
+    echo "Initializing Podman machine '$NAME' with ${MEMORY}MiB RAM..."
+    run_cmd podman machine init --memory "${MEMORY}" "${NAME}"
+    run_cmd podman machine start "${NAME}"
+}
+
+# Populate the caller's valid_* arrays with the Podman machines that meet the minimum
+# Memory/CPU requirements (MIN_MEM_MB / MIN_CPU, overridable above), printing the
+# discovered list as it goes. The four arrays are read from the CALLER's scope via Bash
+# dynamic scoping — use_existing_podman declares them `local -a`, so they stay
+# function-scoped (no global leak, verified on 3.2.57) while this helper fills them.
+function list_valid_machines {
+    local machines_json index machine_count i name mem_raw cpu status mem_mb
+
+    # Get list of all machines with their specs
+    machines_json=$(podman machine list --format json)
+
+    index=0
+    echo "Checking Podman machines for minimum requirements (Memory ≥ ${MIN_MEM_MB}MB, CPUs ≥ ${MIN_CPU})..."
+
+    # Loop over machines using `jq` length and index
+    machine_count=$(echo "$machines_json" | jq 'length')
+
+    for ((i = 0; i < machine_count; i++)); do
+        name=$(echo "$machines_json" | jq -r ".[$i].Name")
+        mem_raw=$(echo "$machines_json" | jq -r ".[$i].Memory")
+        cpu=$(echo "$machines_json" | jq -r ".[$i].CPUs")
+        status=$(echo "$machines_json" | jq -r ".[$i].Running")
+
+        # Normalize Memory to MiB (podman reports bytes on 5.x, MiB on older versions).
+        mem_mb=$(mem_to_mib "$mem_raw")
+
+        if [[ "$mem_mb" -ge "$MIN_MEM_MB" && "$cpu" -ge "$MIN_CPU" ]]; then
+            valid_names[index]="$name"
+            valid_memories[index]="$mem_mb"
+            valid_cpus[index]="$cpu"
+            valid_statuses[index]="$status"
+            echo "$((index + 1)). $name - Memory: ${mem_mb}MB, CPUs: $cpu"
+            ((index++))
+        fi
+    done
+
+    # Explicit success: as the function tail, the loop's own status is data-dependent — a
+    # final `((index++))` post-incrementing 0 (a single qualifying machine) returns 1, and an
+    # unqualified last machine leaves the `if`-test's status. Neither should be our exit code.
+    return 0
+}
+
+# Drive the interactive menu over the caller's valid_* arrays (populated by
+# list_valid_machines, read here via dynamic scoping): pick a machine, create a new one,
+# or exit; start the chosen machine if it isn't running. Returns 0 on a usable machine,
+# non-zero on cancel/EOF. Assumes the caller has already confirmed at least one valid
+# machine exists.
+function prompt_machine_selection {
+    local i display_number create_option exit_option selection selection_index
+    local chosen_machine machine_running
+
+    # Prompt in a loop until valid input
+    while true; do
+        echo
+        echo "Select a Podman machine to use:"
+        for i in "${!valid_names[@]}"; do
+            display_number=$((i + 1))
+            echo "$display_number. ${valid_names[$i]} - Memory: ${valid_memories[$i]}MB, CPUs: ${valid_cpus[$i]}"
+        done
+
+        create_option=$((${#valid_names[@]} + 1))
+        exit_option=$((${#valid_names[@]} + 2))
+
+        echo "$create_option. Create a new Podman machine"
+        echo "$exit_option. None (exit)"
+
+        if [[ -n "$ASSUME_YES" ]]; then
+            selection=1 # unattended: use the first machine that meets the minimums
+        elif ! read -rp "Enter your choice [1-$exit_option]: " selection; then
+            echo "No input (stdin closed); aborting machine selection." >&2
+            return 1
+        fi
+
+        # Check input is numeric
+        if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+            echo "Invalid input: please enter a number between 1 and $exit_option."
+            continue
+        fi
+
+        # Handle "Create a new machine"
+        if [[ "$selection" -eq "$create_option" ]]; then
+            new_podman || return 1
+            return 0
+        fi
+
+        # Handle "None"
+        if [[ "$selection" -eq "$exit_option" ]]; then
+            echo "Exiting without selecting a Podman machine."
+            return 1
+        fi
+
+        # Convert to 0-based index and validate
+        selection_index=$((selection - 1))
+        if [[ "$selection_index" -lt 0 || "$selection_index" -ge ${#valid_names[@]} ]]; then
+            echo "Invalid selection: please enter a number between 1 and $exit_option."
+            continue
+        fi
+
+        # Valid selection
+        chosen_machine="${valid_names[$selection_index]}"
+        machine_running="${valid_statuses[$selection_index]}"
+
+        echo "You selected: $chosen_machine"
+
+        if [[ "$machine_running" != "true" ]]; then
+            echo "Machine '$chosen_machine' is not running."
+            if confirm "Start it now?" n; then
+                echo "Starting Podman machine '$chosen_machine'..."
+                run_cmd podman machine start "$chosen_machine"
+            else
+                echo "Exiting without starting machine."
+                return 1
+            fi
+        fi
+        # Optional: Activate it
+        # podman machine use "$chosen_machine"
+        break
+    done
+
+    return 0
+}
+
+# Reuse an existing Podman machine that meets the minimums, or offer to create one.
+# Orchestrates list_valid_machines (discover/filter) + prompt_machine_selection (menu).
+function use_existing_podman {
+    # Declare the valid_* arrays here (function-local, so nothing leaks to the global
+    # environment) and share them by dynamic scope with the two helpers: list_valid_machines
+    # fills them, prompt_machine_selection reads them. `local -a` localizes arrays in Bash
+    # 3.2 just as `local` does scalars (verified on 3.2.57).
+    local -a valid_names valid_memories valid_cpus valid_statuses
+
+    list_valid_machines
+
+    # No machine met the minimums: offer to create one, else bail.
+    if [[ ${#valid_names[@]} -eq 0 ]]; then
+        echo "No Podman machines meet the minimum requirements (≥ ${MIN_MEM_MB}MB RAM, ≥ ${MIN_CPU} CPUs)."
+        if confirm "Create a new Podman machine with the correct specs?" n; then
+            # new_podman stops any running machine before starting the new one.
+            new_podman || return 1
+            return 0
+        else
+            echo "No machine selected and creation declined."
+            return 1
+        fi
+    fi
+
+    prompt_machine_selection
+}
+
 # True if a KinD cluster with the given name already exists (for the current provider).
 function cluster_exists {
     kind get clusters 2>/dev/null | grep -Fxq "$1"
@@ -733,6 +955,8 @@ function init_cluster {
         echo "[dry-run] would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image kindest/node:${KINDEST_NODE_VERSION}" >&2
         return 0
     fi
+
+    local choice node_image # function-local working vars (the reuse choice and node-image tag)
 
     # Choose and prepare the container runtime (Podman or Docker, both first-class).
     if ! select_runtime; then
@@ -810,6 +1034,25 @@ function require_values_file {
         echo "Error: Helm values file is not readable: '${f}'" >&2
         exit 1
     fi
+}
+
+# Prompt for the Helm values file, falling back to the bundled default when one
+# exists, and validate any named path. Values files are optional, so a blank result
+# (no default present) is fine. Prints the resolved path to stdout (the prompt/UI
+# goes to stderr via `ask`), so callers capture it: `HELM_VALUES=$(prompt_values_file)
+# || exit 1`. A named-but-bad path makes require_values_file exit this command
+# substitution non-zero, which the caller's `|| exit 1` turns into a clean script exit
+# (mirroring the `ACCESS_KEY=$(read_secret …) || exit 1` idiom).
+function prompt_values_file {
+    local vf
+    vf=$(ask "Path to a Helm values file (blank to skip) [default if present=${DEFAULT_HELM_VALUES}]: " "${HELM_VALUES:-}")
+    # Blank falls back to the bundled default only when it actually exists.
+    if [[ -z "$vf" && -f "$DEFAULT_HELM_VALUES" ]]; then
+        vf="$DEFAULT_HELM_VALUES"
+    fi
+    # Optional, but if one is named it must exist and be readable.
+    [[ -n "$vf" ]] && require_values_file "$vf"
+    printf '%s' "$vf"
 }
 
 # Ensure the sumologic Helm repo is registered before any template/upgrade.
@@ -913,16 +1156,9 @@ function install_sumo {
         secret_set sumologic_access_key "$ACCESS_KEY"
     fi
 
-    DEFAULT_HELM_VALUES="$SCRIPT_DIR/values.yaml"
     echo "A Helm values file is optional; the chart can install with --set values alone."
     echo "Example values live in the examples folder, e.g. examples/metrics_interval.yaml"
-    HELM_VALUES=$(ask "Path to a Helm values file (blank to skip) [default if present=${DEFAULT_HELM_VALUES}]: " "${HELM_VALUES:-}")
-    # Blank falls back to the default file only when it actually exists.
-    if [[ -z "$HELM_VALUES" && -f "$DEFAULT_HELM_VALUES" ]]; then
-        HELM_VALUES="$DEFAULT_HELM_VALUES"
-    fi
-    # A values file is optional, but if one is named it must exist.
-    [[ -n "$HELM_VALUES" ]] && require_values_file "$HELM_VALUES"
+    HELM_VALUES=$(prompt_values_file) || exit 1
 
     # Reuse an already-resolved CLUSTER_NAME as the default (e.g. set by reinstall) so the
     # uninstall and reinstall target the same cluster; falls back to DEFAULT_CLUSTER_NAME
@@ -1043,14 +1279,9 @@ function reinstall {
 
 function output {
     require_cmd helm
-    DEFAULT_HELM_VALUES="$SCRIPT_DIR/values.yaml"
-    DEFAULT_K8S_YAML="sumologic-rendered.yaml"
+    local K8S_YAML # CLUSTER_NAME / HELM_VALUES stay global (shared / config knob); K8S_YAML is output-only.
 
-    HELM_VALUES=$(ask "Path to a Helm values file (blank to skip) [default if present=${DEFAULT_HELM_VALUES}]: " "${HELM_VALUES:-}")
-    if [[ -z "$HELM_VALUES" && -f "$DEFAULT_HELM_VALUES" ]]; then
-        HELM_VALUES="$DEFAULT_HELM_VALUES"
-    fi
-    [[ -n "$HELM_VALUES" ]] && require_values_file "$HELM_VALUES"
+    HELM_VALUES=$(prompt_values_file) || exit 1
     CLUSTER_NAME=$(ask "Name of the cluster [default=${DEFAULT_CLUSTER_NAME}]: " "$DEFAULT_CLUSTER_NAME")
     K8S_YAML=$(ask "Name and Location of the rendered Kubernetes Manifest YAML file. [default=sumologic-rendered.yaml]: " "$DEFAULT_K8S_YAML")
 
@@ -1154,25 +1385,36 @@ EOF
     echo "Note: the rendered Secret uses placeholder credentials; deploy with -i/-m to inject real ones." >&2
 }
 
-function uninstall {
+# Shared teardown preamble for uninstall/purge: ensure kind is present and point KinD at
+# the runtime that backs the cluster, so it can find and delete it. select_runtime failure
+# is a clean exit (not the ERR trap), matching the originals.
+function prepare_teardown {
     require_cmd kind
     # Match KinD to the runtime that backs the cluster so it can find/delete it.
     if ! select_runtime; then exit 1; fi
     set_kind_provider
+}
+
+# Delete the named KinD cluster. CLUSTER_NAME is resolved by confirm_destructive (the
+# caller must run it first). Shared by uninstall/purge.
+function delete_kind_cluster {
+    echo "Deleting Cluster: ${CLUSTER_NAME}"
+    run_cmd kind delete cluster --name "${CLUSTER_NAME}"
+}
+
+function uninstall {
+    prepare_teardown
 
     echo "Caution: This will delete the cluster"
     confirm_destructive "delete the cluster"
-    echo "Deleting Cluster: ${CLUSTER_NAME}"
-    run_cmd kind delete cluster --name "${CLUSTER_NAME}"
+    delete_kind_cluster
     if [[ "$CONTAINER_RUNTIME" == "podman" && "$OS" == "darwin" ]]; then
         echo "Leaving Podman machine intact (use --purge to remove it)."
     fi
 }
 
 function purge {
-    require_cmd kind
-    if ! select_runtime; then exit 1; fi
-    set_kind_provider
+    prepare_teardown
 
     # Podman machines only exist with Podman on macOS; under Docker (or Linux
     # Podman) there is no machine to remove.
@@ -1187,8 +1429,7 @@ function purge {
     fi
 
     confirm_destructive "delete the cluster and remove the Podman machine"
-    echo "Deleting Cluster: ${CLUSTER_NAME}"
-    run_cmd kind delete cluster --name "${CLUSTER_NAME}"
+    delete_kind_cluster
     if [[ "$has_machine" == "yes" && -n "$running_machine" ]]; then
         echo "Stopping and Removing the - ${running_machine} - Podman Machine..."
         podman machine stop "${running_machine}"
@@ -1282,184 +1523,6 @@ function status {
     else
         echo "Pods: kubectl not installed; skipping."
     fi
-}
-
-## Helper Functions
-
-# Normalize a `podman machine` Memory value to MiB. Podman has reported this field
-# in bytes (5.x) and in MiB (older versions); decide by magnitude. Any real machine
-# has >= 1 GiB, so a value at/above 1 GiB-in-bytes is bytes, otherwise it's MiB.
-function mem_to_mib {
-    local raw=$1
-    [[ "$raw" =~ ^[0-9]+$ ]] || {
-        echo 0
-        return 0
-    }
-    if [[ "$raw" -ge 1073741824 ]]; then
-        echo $((raw / 1024 / 1024))
-    else
-        echo "$raw"
-    fi
-}
-
-# Only one Podman machine can run at a time. If one is running, offer to stop it.
-# Returns 0 if nothing is running or it was stopped, 1 if the user declines.
-function stop_running_machine {
-    local running_machine
-    running_machine=$(podman machine list --format json | jq -r '.[] | select(.Running == true) | .Name')
-    [[ -z "$running_machine" ]] && return 0
-    echo "Podman machine '$running_machine' is currently running (only one can run at a time)."
-    if confirm "Stop it before continuing?" n; then
-        echo "Stopping '$running_machine'..."
-        podman machine stop "$running_machine"
-        return 0
-    fi
-    echo "Cannot proceed while another machine is running."
-    return 1
-}
-
-function new_podman {
-    echo "Creating a new Podman machine..."
-    DEFAULT_NAME="sumo"
-    DEFAULT_MEMORY="${MIN_MEM_MB}" # default a new machine to the configured minimum
-    MEMORY=$(ask "Allocate memory for Podman machine (in MiB) [default=${DEFAULT_MEMORY}]: " "$DEFAULT_MEMORY")
-    # Validate before handing it to `podman machine init --memory`, which otherwise fails
-    # cryptically on non-numeric input. Reject non-integers hard; warn (don't block) when
-    # below the minimum, matching check_docker_resources' tone for a deliberate choice.
-    if ! [[ "$MEMORY" =~ ^[0-9]+$ ]]; then
-        echo "Error: memory must be a positive integer (MiB), got '${MEMORY}'." >&2
-        return 1
-    fi
-    MEMORY=$((10#$MEMORY)) # normalize: strip leading zeros so the comparison isn't read as octal
-    if [[ "$MEMORY" -lt "$MIN_MEM_MB" ]]; then
-        echo "⚠️  ${MEMORY}MiB is below the recommended minimum (${MIN_MEM_MB}MiB); the Sumo stack may be unstable." >&2
-    fi
-    NAME=$(ask "Name of the Podman machine [default=${DEFAULT_NAME}]: " "$DEFAULT_NAME")
-
-    # Free the single run slot before creating/starting the new machine.
-    stop_running_machine || return 1
-
-    echo "Initializing Podman machine '$NAME' with ${MEMORY}MiB RAM..."
-    run_cmd podman machine init --memory "${MEMORY}" "${NAME}"
-    run_cmd podman machine start "${NAME}"
-}
-
-function use_existing_podman {
-    # Minimum requirements come from MIN_MEM_MB / MIN_CPU (set/overridable above).
-
-    # Get list of all machines with their specs
-    machines_json=$(podman machine list --format json)
-
-    # Arrays to hold valid machines
-    declare -a valid_names valid_memories valid_cpus valid_statuses
-
-    index=0
-    echo "Checking Podman machines for minimum requirements (Memory ≥ ${MIN_MEM_MB}MB, CPUs ≥ ${MIN_CPU})..."
-
-    # Loop over machines using `jq` length and index
-    machine_count=$(echo "$machines_json" | jq 'length')
-
-    for ((i = 0; i < machine_count; i++)); do
-        name=$(echo "$machines_json" | jq -r ".[$i].Name")
-        mem_raw=$(echo "$machines_json" | jq -r ".[$i].Memory")
-        cpu=$(echo "$machines_json" | jq -r ".[$i].CPUs")
-        status=$(echo "$machines_json" | jq -r ".[$i].Running")
-
-        # Normalize Memory to MiB (podman reports bytes on 5.x, MiB on older versions).
-        mem_mb=$(mem_to_mib "$mem_raw")
-
-        if [[ "$mem_mb" -ge "$MIN_MEM_MB" && "$cpu" -ge "$MIN_CPU" ]]; then
-            valid_names[index]="$name"
-            valid_memories[index]="$mem_mb"
-            valid_cpus[index]="$cpu"
-            valid_statuses[index]="$status"
-            echo "$((index + 1)). $name - Memory: ${mem_mb}MB, CPUs: $cpu"
-            ((index++))
-        fi
-    done
-
-    # Check if any valid machine was found
-    if [[ ${#valid_names[@]} -eq 0 ]]; then
-        echo "No Podman machines meet the minimum requirements (≥ ${MIN_MEM_MB}MB RAM, ≥ ${MIN_CPU} CPUs)."
-        if confirm "Create a new Podman machine with the correct specs?" n; then
-            # new_podman stops any running machine before starting the new one.
-            new_podman || return 1
-            return 0
-        else
-            echo "No machine selected and creation declined."
-            return 1
-        fi
-    fi
-
-    # Prompt in a loop until valid input
-    while true; do
-        echo
-        echo "Select a Podman machine to use:"
-        for i in "${!valid_names[@]}"; do
-            display_number=$((i + 1))
-            echo "$display_number. ${valid_names[$i]} - Memory: ${valid_memories[$i]}MB, CPUs: ${valid_cpus[$i]}"
-        done
-
-        create_option=$((${#valid_names[@]} + 1))
-        exit_option=$((${#valid_names[@]} + 2))
-
-        echo "$create_option. Create a new Podman machine"
-        echo "$exit_option. None (exit)"
-
-        if [[ -n "$ASSUME_YES" ]]; then
-            selection=1 # unattended: use the first machine that meets the minimums
-        elif ! read -rp "Enter your choice [1-$exit_option]: " selection; then
-            echo "No input (stdin closed); aborting machine selection." >&2
-            return 1
-        fi
-
-        # Check input is numeric
-        if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
-            echo "Invalid input: please enter a number between 1 and $exit_option."
-            continue
-        fi
-
-        # Handle "Create a new machine"
-        if [[ "$selection" -eq "$create_option" ]]; then
-            new_podman || return 1
-            return 0
-        fi
-
-        # Handle "None"
-        if [[ "$selection" -eq "$exit_option" ]]; then
-            echo "Exiting without selecting a Podman machine."
-            return 1
-        fi
-
-        # Convert to 0-based index and validate
-        selection_index=$((selection - 1))
-        if [[ "$selection_index" -lt 0 || "$selection_index" -ge ${#valid_names[@]} ]]; then
-            echo "Invalid selection: please enter a number from 1 and $exit_option."
-            continue
-        fi
-
-        # Valid selection
-        chosen_machine="${valid_names[$selection_index]}"
-        machine_running="${valid_statuses[$selection_index]}"
-
-        echo "You selected: $chosen_machine"
-
-        if [[ "$machine_running" != "true" ]]; then
-            echo "Machine '$chosen_machine' is not running."
-            if confirm "Start it now?" n; then
-                echo "Starting Podman machine '$chosen_machine'..."
-                run_cmd podman machine start "$chosen_machine"
-            else
-                echo "Exiting without starting machine."
-                return 1
-            fi
-        fi
-        # Optional: Activate it
-        # podman machine use "$chosen_machine"
-        break
-    done
-
-    return 0
 }
 
 # Report errors without destroying anything. Previously this trap ran the

@@ -73,6 +73,33 @@ setup() {
     assert_called '^secret_delete sumologic_access_key'
 }
 
+# --- shared teardown skeleton (prepare_teardown / delete_kind_cluster) -------
+# uninstall and purge share a preamble (require_cmd kind -> select_runtime ->
+# set_kind_provider) and the kind-delete step; guard that the extraction didn't drop
+# or reorder a preamble step, and that a runtime-selection failure still aborts cleanly.
+
+@test "prepare_teardown: uninstall runs the full preamble before the kind delete" {
+    # Record the preamble steps (setup stubs them as silent no-ops) so a dropped step shows.
+    require_cmd() { echo "require_cmd $*" >>"$CALLS"; }
+    select_runtime() {
+        echo "select_runtime" >>"$CALLS"
+        return 0
+    }
+    set_kind_provider() { echo "set_kind_provider" >>"$CALLS"; }
+    FORCE=yes ASSUME_YES="" run uninstall
+    # Chained so each step is load-bearing on macOS bats (only a test's last command counts).
+    [ "$status" -eq 0 ] && assert_called '^require_cmd kind' && assert_called '^select_runtime' \
+        && assert_called '^set_kind_provider' && assert_called '^kind delete cluster --name sumo'
+}
+
+@test "prepare_teardown: a select_runtime failure aborts before deleting (no kind delete)" {
+    run bash -c 'source "$1"; require_cmd(){ :;}; set_kind_provider(){ :;}
+        select_runtime(){ return 1; }            # runtime cannot be selected
+        kind(){ echo CALLED_KIND; }; FORCE=yes; ASSUME_YES=""; uninstall' _ "$SCRIPT"
+    # Combined (load-bearing last command): clean exit 1 AND nothing was deleted.
+    [[ "$output" != *"CALLED_KIND"* ]] && [ "$status" -eq 1 ]
+}
+
 # --- install_sumo / output arg-building (run in a subshell to contain their
 #     EXIT trap so it cannot interfere with bats teardown) --------------------
 
@@ -85,7 +112,12 @@ setup() {
     [[ "$output" == *"fullnameOverride=sumo"* ]]
     [[ "$output" == *"sumologic.falco.enabled=false"* ]]
     [[ "$output" == *"sumologic.logs.systemd.enabled=false"* ]]
-    [[ "$output" == *"--kube-context kind-sumo"* ]] # pinned to the named KinD cluster, not the current context
+    # Final, combined assertion so BOTH halves are load-bearing on macOS bats (which only
+    # checks a test's last command): the context is pinned to the named cluster AND the
+    # resolved values file (blank prompt -> bundled values.yaml) actually reaches the argv,
+    # ahead of the secrets --values. The latter guards the prompt_values_file extraction —
+    # a dropped helper would leave only the secrets --values.
+    [[ "$output" == *"--kube-context kind-sumo"* && "$output" == *"values.yaml --values "* ]]
 }
 
 @test "install_sumo: credentials never appear on the helm command line" {
@@ -414,7 +446,68 @@ setup() {
     [[ "$output" == *"--version 5.2.0"* ]]
     [[ "$output" == *"sumologic.clusterName=sumo"* ]]
     [[ "$output" == *"fullnameOverride=sumo"* ]]
-    [[ "$output" != *"PLACEHOLDER_ACCESS"* ]]
+    # Final, combined assertion so BOTH halves are load-bearing on macOS bats: the resolved
+    # values file reaches the template argv ahead of secrets, AND creds never appear on argv.
+    [[ "$output" == *"values.yaml --values "* && "$output" != *"PLACEHOLDER_ACCESS"* ]]
+}
+
+# --- prompt_values_file (shared helper for install_sumo + output) -----------
+# Extracted from the duplicated prompt-and-default block: prompt -> bundled-default
+# fallback -> validate, printing the resolved path to stdout (UI via `ask` -> stderr).
+# A bad named path makes require_values_file exit non-zero so the caller's `|| exit 1`
+# turns it into a clean script exit. NB: the function has a `local vf`, so the ask
+# stubs use a distinctly-named VF_IN to avoid a dynamic-scoping collision.
+
+# Tests 1-3 capture both the returned value AND `rc=$?` into the marker, then assert
+# the combined `RESULT=[…] RC=[…]` as the single LAST command — so the success path is
+# load-bearing on macOS bats too (which only checks a test's last command). A bare
+# `[ "$status" -eq 0 ]` would be inert here: strict mode is off when sourced, so a
+# failing helper still lets the trailing printf run and the wrapper exits 0.
+
+@test "prompt_values_file: an explicit path is returned (and validated)" {
+    local vf="${BATS_TEST_TMPDIR}/my-values.yaml"
+    : >"$vf" # exists + readable, so the REAL require_values_file passes
+    run bash -c 'source "$1"; VF_IN="$2"
+        ask(){ printf "%s" "$VF_IN"; }   # user types an explicit path
+        out=$(prompt_values_file); rc=$?; printf "RESULT=[%s] RC=[%s]" "$out" "$rc"' _ "$SCRIPT" "$vf"
+    [[ "$output" == *"RESULT=[${vf}] RC=[0]"* ]]
+}
+
+@test "prompt_values_file: blank input falls back to the bundled default when it exists" {
+    local def="${BATS_TEST_TMPDIR}/default-values.yaml"
+    : >"$def"
+    run bash -c 'source "$1"; def="$2"
+        DEFAULT_HELM_VALUES="$def"
+        ask(){ printf ""; }              # blank (Enter)
+        out=$(prompt_values_file); rc=$?; printf "RESULT=[%s] RC=[%s]" "$out" "$rc"' _ "$SCRIPT" "$def"
+    [[ "$output" == *"RESULT=[${def}] RC=[0]"* ]]
+}
+
+@test "prompt_values_file: blank input with no default yields an empty (skip) result" {
+    run bash -c 'source "$1"
+        DEFAULT_HELM_VALUES="/no/such/default.yaml"
+        ask(){ printf ""; }
+        out=$(prompt_values_file); rc=$?; printf "RESULT=[%s] RC=[%s]" "$out" "$rc"' _ "$SCRIPT"
+    [[ "$output" == *"RESULT=[] RC=[0]"* ]] # empty + success -> chart installs with --set values alone
+}
+
+@test "prompt_values_file: a preset HELM_VALUES (env/config knob) threads through on EOF/unattended" {
+    # Regression guard that the `\${HELM_VALUES:-}` default is still passed to `ask` (a mutant
+    # dropping it silently skips the preset file). Drives the REAL ask via closed stdin.
+    local pre="${BATS_TEST_TMPDIR}/preset.yaml"
+    : >"$pre"
+    run bash -c 'source "$1"; HELM_VALUES="$2"; DEFAULT_HELM_VALUES="/no/such/default.yaml"
+        out=$(prompt_values_file </dev/null); rc=$?; printf "RESULT=[%s] RC=[%s]" "$out" "$rc"' _ "$SCRIPT" "$pre"
+    [[ "$output" == *"RESULT=[${pre}] RC=[0]"* ]] # preset returned, not skipped
+}
+
+@test "prompt_values_file: a named-but-missing path exits non-zero with a clear error" {
+    run bash -c 'source "$1"
+        ask(){ printf "%s" "/no/such/file.yaml"; }   # uses the REAL require_values_file
+        prompt_values_file' _ "$SCRIPT"
+    # Combined so both halves are load-bearing on macOS bats: the clear "not found" message
+    # AND the non-zero exit (which the caller's `|| exit 1` turns into a clean script exit).
+    [[ "$output" == *"not found"* ]] && [ "$status" -ne 0 ]
 }
 
 # --- status (read-only doctor; every probe must be non-fatal under errexit) -
@@ -586,6 +679,139 @@ run_status() {
     [ "$status" -eq 0 ]
     [[ "$output" != *"below the recommended"* ]]
     [[ "$output" == *"PODMAN machine init --memory 20000"* ]]
+}
+
+# --- use_existing_podman scoping --------------------------------------------
+# Regression guard for the unscoped-locals fix: the function must select a
+# qualifying machine AND leave no working variable behind in the global scope.
+# (On the pre-fix code all 16 scalars leaked; the four arrays were already local
+# via `declare -a`, which localizes inside a function in Bash 3.2.)
+
+@test "use_existing_podman: picks a qualifying machine and leaks no globals" {
+    run bash -c 'source "$1"
+        trap - ERR EXIT
+        MIN_MEM_MB=2048; MIN_CPU=1; ASSUME_YES=yes
+        podman(){ if [ "$*" = "machine list --format json" ]; then
+            printf "%s" "[{\"Name\":\"sumo\",\"Memory\":21474836480,\"CPUs\":8,\"Running\":true}]"
+          else echo "PODMAN $*"; fi; }
+        use_existing_podman >/dev/null   # menu output is irrelevant; rc + leak check below
+        rc=$?
+        leaked=""
+        for v in machines_json index machine_count name mem_raw cpu status mem_mb \
+                 display_number create_option exit_option selection selection_index \
+                 chosen_machine machine_running valid_names valid_memories valid_cpus valid_statuses; do
+            eval "val=\${$v:-}"
+            [ -z "$val" ] || leaked="$leaked $v=$val"
+        done
+        echo "RC=$rc"
+        echo "LEAKED:${leaked}"' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=0"* ]]      # selected the running, qualifying machine
+    [[ "$output" == *"LEAKED:"* ]]   # the marker line printed at all
+    [[ "$output" != *"LEAKED: "* ]]  # ...with nothing after the colon -> no leaked vars
+}
+
+# --- list_valid_machines / prompt_machine_selection (the split helpers) ------
+# use_existing_podman was split into list_valid_machines (discover+filter, fills the
+# caller's valid_* arrays) and prompt_machine_selection (menu over those arrays). The
+# arrays stay `local -a` in use_existing_podman and are shared with the helpers by Bash
+# dynamic scoping; these guard that contract (fill, read, and the no-valid orchestration).
+
+@test "list_valid_machines: fills the caller's valid_* arrays, filtering by the minimums" {
+    run bash -c 'source "$1"
+        MIN_MEM_MB=2048; MIN_CPU=1
+        podman(){ printf "%s" "[{\"Name\":\"big\",\"Memory\":21474836480,\"CPUs\":8,\"Running\":true},{\"Name\":\"tiny\",\"Memory\":1073741824,\"CPUs\":1,\"Running\":false}]"; }
+        wrap(){ local -a valid_names valid_memories valid_cpus valid_statuses
+            list_valid_machines >/dev/null     # discovered list is irrelevant here
+            printf "NAMES=[%s] MEM=[%s] CPU=[%s] STAT=[%s] N=%s" \
+                "${valid_names[*]}" "${valid_memories[*]}" "${valid_cpus[*]}" "${valid_statuses[*]}" "${#valid_names[@]}"; }
+        wrap' _ "$SCRIPT"
+    # "big" (20480MB/8cpu) qualifies; "tiny" (1024MB) is filtered out -> exactly one entry.
+    [[ "$output" == *"NAMES=[big] MEM=[20480] CPU=[8] STAT=[true] N=1"* ]]
+}
+
+@test "prompt_machine_selection: reads the caller's arrays and starts a non-running pick" {
+    run bash -c 'source "$1"
+        confirm(){ return 0; }                 # yes, start it
+        podman(){ echo "podman $*"; }
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("false")
+            ASSUME_YES=yes                      # auto-selects machine #1
+            prompt_machine_selection; }
+        wrap' _ "$SCRIPT"
+    [ "$status" -eq 0 ] && [[ "$output" == *"You selected: m1"* ]] && [[ "$output" == *"podman machine start m1"* ]]
+}
+
+@test "use_existing_podman: no qualifying machine + declined creation returns non-zero" {
+    run bash -c 'source "$1"
+        MIN_MEM_MB=999999; MIN_CPU=1           # nothing can qualify
+        podman(){ printf "%s" "[{\"Name\":\"tiny\",\"Memory\":1073741824,\"CPUs\":1,\"Running\":false}]"; }
+        confirm(){ return 1; }                  # decline creating a new machine
+        use_existing_podman' _ "$SCRIPT"
+    # The no-valid branch reads the (empty) dynamic-scoped array and bails cleanly.
+    [[ "$output" == *"No Podman machines meet the minimum"* ]] && [ "$status" -ne 0 ]
+}
+
+@test "list_valid_machines: returns 0 when exactly one machine qualifies (rc not data-dependent)" {
+    # Regression guard: the loop's trailing `((index++))` post-incrementing 0 must not become
+    # the helper's exit status (it returns 1), which would abort use_existing_podman under
+    # set -e on the common single-machine case. An explicit `return 0` fixes it.
+    run bash -c 'source "$1"
+        MIN_MEM_MB=2048; MIN_CPU=1
+        podman(){ printf "%s" "[{\"Name\":\"only\",\"Memory\":21474836480,\"CPUs\":8,\"Running\":true}]"; }
+        wrap(){ local -a valid_names valid_memories valid_cpus valid_statuses
+            list_valid_machines >/dev/null; printf "RC=[%s] N=[%s]" "$?" "${#valid_names[@]}"; }
+        wrap' _ "$SCRIPT"
+    [[ "$output" == *"RC=[0] N=[1]"* ]] # found the one machine AND returned success
+}
+
+# prompt_machine_selection menu branches (all driven with ASSUME_YES='' over a 1-element
+# array, so create_option=2 / exit_option=3). Each asserts a single combined last command
+# so every check is load-bearing on macOS bats.
+
+@test "prompt_machine_selection: EOF on the menu read aborts with a clear message" {
+    run bash -c 'source "$1"
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("true")
+            ASSUME_YES=""; prompt_machine_selection </dev/null; }
+        wrap' _ "$SCRIPT"
+    [[ "$output" == *"aborting machine selection"* ]] && [ "$status" -ne 0 ]
+}
+
+@test "prompt_machine_selection: choosing 'None (exit)' returns non-zero without selecting" {
+    run bash -c 'source "$1"
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("true")
+            ASSUME_YES=""; prompt_machine_selection <<<"3"; }
+        wrap' _ "$SCRIPT"
+    [[ "$output" == *"Exiting without selecting a Podman machine"* ]] && [ "$status" -ne 0 ]
+}
+
+@test "prompt_machine_selection: choosing 'Create a new Podman machine' calls new_podman" {
+    run bash -c 'source "$1"
+        new_podman(){ echo "NEW_PODMAN_RAN"; return 0; }
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("true")
+            ASSUME_YES=""; prompt_machine_selection <<<"2"; }
+        wrap' _ "$SCRIPT"
+    [ "$status" -eq 0 ] && [[ "$output" == *"NEW_PODMAN_RAN"* ]]
+}
+
+@test "prompt_machine_selection: non-numeric then out-of-range input re-prompts, then selects" {
+    run bash -c 'source "$1"
+        confirm(){ return 0; }; podman(){ echo "podman $*"; }
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("true")
+            ASSUME_YES=""; prompt_machine_selection <<<"abc
+9
+1"; }
+        wrap' _ "$SCRIPT"
+    [[ "$output" == *"Invalid input"* ]] && [[ "$output" == *"Invalid selection"* ]] && [ "$status" -eq 0 ]
+}
+
+@test "prompt_machine_selection: declining 'Start it now?' on a stopped machine returns non-zero" {
+    run bash -c 'source "$1"
+        confirm(){ return 1; }                  # decline starting
+        podman(){ echo "podman $*"; }
+        wrap(){ local -a valid_names=("m1") valid_memories=("8192") valid_cpus=("4") valid_statuses=("false")
+            ASSUME_YES=yes; prompt_machine_selection; }
+        wrap' _ "$SCRIPT"
+    [[ "$output" == *"Exiting without starting machine"* ]] && [[ "$output" != *"podman machine start"* ]] && [ "$status" -ne 0 ]
 }
 
 # --- select_chart_version ---------------------------------------------------

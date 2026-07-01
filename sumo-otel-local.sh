@@ -6,31 +6,35 @@
 
 # --- Usage --------------------------------------------------------------------
 function help {
-    echo "Usage: $0 [options]"
-    echo "Options:"
-    echo "  -h, --help      Display this help message."
-    echo "  -i, --install   Install the dependencies and setup the Sumo Operator."
-    echo "  -n, --init      Install dependencies without setting up the Sumo Operator."
-    echo "  -m, --helm      Install or upgrade the Sumo collector on an existing cluster."
-    echo "  -r, --reinstall Uninstall the Sumo collector then reinstall it (cluster stays)."
-    echo "  -o, --output    Output the rendered Kubernetes manifest YAML file."
-    echo "  -s, --status    Report cluster and collector health (read-only)."
-    echo "  -e, --endpoints Print the Sumo collection endpoints from the 'sumologic' secret."
-    echo "      --forward   Port-forward the traces collector's OTLP receiver to localhost:4317/4318."
-    echo "  -p, --purge     Uninstall the cluster (and, with Podman on macOS, the Podman machine)."
-    echo "  -u, --uninstall Uninstall the Cluster only."
-    echo "  -v, --version   Display the version of the script."
-    echo "      --init-config  Create .sumo-otel-local.env from the bundled template, then edit it"
+    # Flags are coloured bold-green, headings bold, the footer dim. Colour vars are empty
+    # unless stderr is a TTY (set at top level; help is only ever called after that), so the
+    # TEXT is unchanged when captured/piped — the tests match on the plain substrings.
+    local f="${C_BOLD}${C_GREEN}" h="${C_BOLD}" d="${C_DIM}" r="${C_RESET}"
+    echo "${h}Usage:${r} $0 [options]"
+    echo "${h}Options:${r}"
+    echo "  ${f}-h, --help${r}      Display this help message."
+    echo "  ${f}-i, --install${r}   Install the dependencies and setup the Sumo Operator."
+    echo "  ${f}-n, --init${r}      Install dependencies without setting up the Sumo Operator."
+    echo "  ${f}-m, --helm${r}      Install or upgrade the Sumo collector on an existing cluster."
+    echo "  ${f}-r, --reinstall${r} Uninstall the Sumo collector then reinstall it (cluster stays)."
+    echo "  ${f}-o, --output${r}    Output the rendered Kubernetes manifest YAML file."
+    echo "  ${f}-s, --status${r}    Report cluster and collector health (read-only)."
+    echo "  ${f}-e, --endpoints${r} Print the Sumo collection endpoints from the 'sumologic' secret."
+    echo "      ${f}--forward${r}   Port-forward the traces collector's OTLP receiver to localhost:4317/4318."
+    echo "  ${f}-p, --purge${r}     Uninstall the cluster (and, with Podman on macOS, the Podman machine)."
+    echo "  ${f}-u, --uninstall${r} Uninstall the Cluster only."
+    echo "  ${f}-v, --version${r}   Display the version of the script."
+    echo "      ${f}--init-config${r}  Create .sumo-otel-local.env from the bundled template, then edit it"
     echo "                  to preset the Sumo region, cluster, chart version, etc. and skip prompts."
-    echo "  -y, --yes       Run unattended: assume yes and use defaults for all prompts."
+    echo "  ${f}-y, --yes${r}       Run unattended: assume yes and use defaults for all prompts."
     echo "                  (also via the ASSUME_YES env var; --non-interactive is an alias)"
-    echo "  -f, --force     Confirm destructive teardown (-u/-p) non-interactively."
+    echo "  ${f}-f, --force${r}     Confirm destructive teardown (-u/-p) non-interactively."
     echo "                  Required for -u/-p under -y; never read from the environment."
-    echo "      --dry-run   Preview the install flow (-i/-n/-m): print the cluster-create and"
+    echo "      ${f}--dry-run${r}   Preview the install flow (-i/-n/-m): print the cluster-create and"
     echo "                  helm commands without creating/installing anything."
-    echo "  -V, --verbose   Echo each external command (kind/helm/podman) before running it."
+    echo "  ${f}-V, --verbose${r}   Echo each external command (kind/helm/podman) before running it."
     echo
-    echo "Short flags may be combined, e.g. -yi is the same as -y -i."
+    echo "${d}Short flags may be combined, e.g. -yi is the same as -y -i.${r}"
 }
 
 # Detect OS and CPU architecture, normalized to the tokens used by release assets.
@@ -77,6 +81,20 @@ else
     SECRET_BACKEND="env"
 fi
 
+# Terminal colours for prompts, the banner, and status words. Enabled ONLY when stderr is a
+# TTY and NO_COLOR is unset (https://no-color.org, an ENVIRONMENT convention — so it's read
+# here, before the config file) — piped/redirected/CI output, and the captured output the
+# test suite asserts on, stay plain (no escape codes leak in). UI goes to stderr, so the gate
+# is on fd 2. Defined before the config load so the loader's own warnings can use them. Bash
+# 3.2: plain string vars, not an associative array. NB: cyan/yellow wash out to near-white
+# when combined with bold on many themes, so bold is paired only with blue/green/red/magenta.
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_DIM=$'\033[2m'
+    C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m' C_MAGENTA=$'\033[35m'
+else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_MAGENTA=""
+fi
+
 # Optional project-local config for repeatable runs. A shell snippet of KEY=value lines
 # (no YAML parser needed); it is sourced with `set -a` BEFORE the constants below, so it
 # can set any env knob the script reads: CONTAINER_RUNTIME, CLUSTER_NAME, HELM_VALUES,
@@ -90,15 +108,15 @@ if [[ -f "$SUMO_CONFIG_FILE" ]]; then
         # Discourage plaintext credentials on disk: warn if the file assigns them (the loader
         # still sources it, but creds belong in secret storage or SUMOLOGIC_ACCESS_ID/KEY).
         if grep -qE '^[[:space:]]*(export[[:space:]]+)?SUMOLOGIC_ACCESS_(ID|KEY)=' "$SUMO_CONFIG_FILE"; then
-            echo "Warning: ${SUMO_CONFIG_FILE} sets Sumo credentials — storing them in a plaintext" >&2
-            echo "         config on disk is discouraged; prefer secret storage or the environment." >&2
+            echo "${C_YELLOW}Warning: ${SUMO_CONFIG_FILE} sets Sumo credentials — storing them in a plaintext" >&2
+            echo "         config on disk is discouraged; prefer secret storage or the environment.${C_RESET}" >&2
         fi
         set -a
         # shellcheck disable=SC1090
         . "$SUMO_CONFIG_FILE"
         set +a
     else
-        echo "Warning: config file ${SUMO_CONFIG_FILE} exists but is not readable; skipping it." >&2
+        echo "${C_YELLOW}Warning: config file ${SUMO_CONFIG_FILE} exists but is not readable; skipping it.${C_RESET}" >&2
     fi
 fi
 
@@ -260,7 +278,7 @@ function confirm {
     fi
     # On EOF/closed stdin (e.g. piped input with no -y) fall back to the default with a
     # clear note, rather than letting the unguarded read fail and abort via the ERR trap.
-    if ! read -rp "${prompt} ${hint} " reply; then
+    if ! read -rp "${C_BOLD}${C_BLUE}${prompt} ${hint}${C_RESET} " reply; then
         echo "No input (stdin closed); using default '${default}'. Pass -y to run unattended." >&2
         reply=$default
     fi
@@ -279,7 +297,7 @@ function ask {
     # On EOF/closed stdin (e.g. piped input with no -y) fall back to the default with a
     # note on stderr, rather than letting the unguarded read fail and abort via the ERR
     # trap (ask is captured with $(...), so the note must not go to stdout).
-    if ! read -rp "$prompt" reply; then
+    if ! read -rp "${C_BOLD}${C_BLUE}${prompt}${C_RESET}" reply; then
         echo "No input (stdin closed); using default '${default}'. Pass -y to run unattended." >&2
     fi
     printf '%s' "${reply:-$default}"
@@ -293,13 +311,17 @@ function ask {
 function read_secret {
     local prompt=$1 value
     while true; do
-        if ! read -rsp "$prompt" value; then
+        if ! read -rsp "${C_BOLD}${C_BLUE}${prompt}${C_RESET}" value; then
             echo "" >&2
             echo "No input (stdin closed); aborting." >&2
             return 1
         fi
         echo "" >&2
         if [[ -n "$value" ]]; then
+            # Silent read shows nothing as you type/paste; echo a masked confirmation (one '*'
+            # per character) so it's clear the value registered and its length looks right,
+            # without revealing it. To stderr, so the captured stdout stays exactly the value.
+            printf '%s\n' "${C_DIM}${value//?/*}${C_RESET}" >&2
             printf '%s' "$value"
             return 0
         fi
@@ -358,7 +380,7 @@ function require_cmd {
 # NB: named run_cmd, not run, to avoid clobbering bats-core's `run` when the test suite
 # sources this script.
 function run_cmd {
-    [[ -n "$VERBOSE" ]] && echo "+ $*" >&2
+    [[ -n "$VERBOSE" ]] && echo "${C_BOLD}${C_BLUE}+ $*${C_RESET}" >&2
     "$@"
 }
 
@@ -530,7 +552,7 @@ function install_deps_direct {
 function install_dependencies {
     # --dry-run previews the install flow without side effects, so don't install anything.
     if [[ -n "$DRY_RUN" ]]; then
-        echo "[dry-run] would install any missing dependencies (kind, kubectl, helm, jq, and a container runtime)." >&2
+        echo "${C_BOLD}${C_BLUE}[dry-run]${C_RESET} would install any missing dependencies (kind, kubectl, helm, jq, and a container runtime)." >&2
         return 0
     fi
 
@@ -624,7 +646,7 @@ function select_node_image {
     if [[ ${#tags[@]} -eq 0 ]]; then
         echo "Could not fetch a tag list (offline or API change)." >&2
         while true; do
-            read -rp "Enter a kindest/node version tag (e.g. v1.32.2), blank for kind's default: " manual || manual=""
+            read -rp "${C_BOLD}${C_BLUE}Enter a kindest/node version tag (e.g. v1.32.2), blank for kind's default: ${C_RESET}" manual || manual=""
             if [[ -z "$manual" ]]; then
                 return 0 # blank / EOF -> use kind's built-in default (no output)
             elif valid_node_tag "$manual"; then
@@ -643,7 +665,7 @@ function select_node_image {
     printf "%3d. %s\n" "$manual_option" "Enter a tag manually" >&2
 
     while true; do
-        if ! read -rp "Select a version [1-${manual_option}]: " selection; then
+        if ! read -rp "${C_BOLD}${C_BLUE}Select a version [1-${manual_option}]: ${C_RESET}" selection; then
             echo "No input (stdin closed); using kind's default Kubernetes version." >&2
             return 0
         fi
@@ -652,7 +674,7 @@ function select_node_image {
             continue
         fi
         if [[ "$selection" -eq "$manual_option" ]]; then
-            if ! read -rp "Enter a kindest/node version tag (e.g. v1.32.2): " manual; then
+            if ! read -rp "${C_BOLD}${C_BLUE}Enter a kindest/node version tag (e.g. v1.32.2): ${C_RESET}" manual; then
                 echo "No input (stdin closed); using kind's default Kubernetes version." >&2
                 return 0
             fi
@@ -706,7 +728,7 @@ function select_chart_version {
     printf "%3d. %s\n" "$manual_option" "Enter a version manually" >&2
 
     while true; do
-        if ! read -rp "Select a version [1-${manual_option}, blank=${default}]: " selection; then
+        if ! read -rp "${C_BOLD}${C_BLUE}Select a version [1-${manual_option}, blank=${default}]: ${C_RESET}" selection; then
             echo "No input (stdin closed); using the pinned default ${default}." >&2
             printf '%s' "$default"
             return 0
@@ -720,7 +742,7 @@ function select_chart_version {
             continue
         fi
         if [[ "$selection" -eq "$manual_option" ]]; then
-            if ! read -rp "Enter a chart version (e.g. 5.2.0): " manual; then
+            if ! read -rp "${C_BOLD}${C_BLUE}Enter a chart version (e.g. 5.2.0): ${C_RESET}" manual; then
                 echo "No input (stdin closed); using the pinned default ${default}." >&2
                 printf '%s' "$default"
                 return 0
@@ -767,7 +789,7 @@ function select_runtime {
         fi
         echo "Both Podman and Docker are available." >&2
         while true; do
-            if ! read -rp "Which runtime should KinD use? [podman/docker] (default=podman): " choice; then
+            if ! read -rp "${C_BOLD}${C_BLUE}Which runtime should KinD use? [podman/docker] (default=podman): ${C_RESET}" choice; then
                 echo "No input (stdin closed); defaulting to podman." >&2
                 choice="podman"
             fi
@@ -973,7 +995,7 @@ function prompt_machine_selection {
 
         if [[ -n "$ASSUME_YES" ]]; then
             selection=1 # unattended: use the first machine that meets the minimums
-        elif ! read -rp "Enter your choice [1-$exit_option]: " selection; then
+        elif ! read -rp "${C_BOLD}${C_BLUE}Enter your choice [1-$exit_option]: ${C_RESET}" selection; then
             echo "No input (stdin closed); aborting machine selection." >&2
             return 1
         fi
@@ -1064,8 +1086,8 @@ function init_cluster {
     # setup, no Podman machine, no `kind create`. (Shows the pinned-default create command.)
     if [[ -n "$DRY_RUN" ]]; then
         local cn="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
-        echo "[dry-run] would prepare the container runtime, then run:" >&2
-        echo "[dry-run] would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image ${KINDEST_NODE_IMAGE}" >&2
+        echo "${C_BOLD}${C_BLUE}[dry-run]${C_RESET} would prepare the container runtime, then run:" >&2
+        echo "${C_BOLD}${C_BLUE}[dry-run]${C_RESET} would run: kind create cluster --name ${cn} --config ${SCRIPT_DIR}/kind-config.yaml --image ${KINDEST_NODE_IMAGE}" >&2
         return 0
     fi
 
@@ -1375,13 +1397,13 @@ function resolve_sumo_endpoint {
     if [[ -n "$want" ]]; then
         base=$(sumo_region_to_endpoint "$want")
         case "$base" in
-            http://*) echo "Warning: '${base}' is http:// — credentials will be sent unencrypted." >&2 ;;
+            http://*) echo "${C_YELLOW}Warning: '${base}' is http:// — credentials will be sent unencrypted.${C_RESET}" >&2 ;;
         esac
         echo "Verifying Sumo credentials against ${base}..." >&2
         code=$(sumo_api_status "$base" "$id" "$key")
         case "$code" in
             200 | 403) # 403 = authenticated but limited role: the endpoint/region is right
-                echo "Credentials verified (${base})." >&2
+                echo "${C_BOLD}${C_GREEN}Credentials verified (${base}).${C_RESET}" >&2
                 RESOLVED_ENDPOINT=$base
                 return 0
                 ;;
@@ -1445,7 +1467,7 @@ function install_sumo {
             echo "Error: Access ID not found and running unattended. Set SUMOLOGIC_ACCESS_ID or store it first." >&2
             exit 1
         fi
-        echo "Sumo Logic Access ID not found in secret storage"
+        echo "${C_YELLOW}Sumo Logic Access ID not found in secret storage${C_RESET}"
         ACCESS_ID=$(read_secret "Enter Sumo Logic Access ID: ") || exit 1
         secret_set sumologic_access_id "$ACCESS_ID"
     fi
@@ -1456,7 +1478,7 @@ function install_sumo {
             echo "Error: Access Key not found and running unattended. Set SUMOLOGIC_ACCESS_KEY or store it first." >&2
             exit 1
         fi
-        echo "Sumo Logic Access Key not found in secret storage"
+        echo "${C_YELLOW}Sumo Logic Access Key not found in secret storage${C_RESET}"
         ACCESS_KEY=$(read_secret "Enter Sumo Logic Access Key: ") || exit 1
         secret_set sumologic_access_key "$ACCESS_KEY"
     fi
@@ -1480,7 +1502,7 @@ function install_sumo {
     # confusing double-prompt; reuse it. A direct -m/--helm leaves CLUSTER_NAME_RESOLVED empty,
     # so install_sumo still prompts (defaulting to any env/config CLUSTER_NAME).
     if [[ -n "$CLUSTER_NAME_RESOLVED" ]]; then
-        echo "Using cluster '${CLUSTER_NAME}'."
+        echo "${C_BOLD}${C_GREEN}Using cluster '${CLUSTER_NAME}'.${C_RESET}"
     else
         CLUSTER_NAME=$(ask_cluster_name "Name of the cluster [default=${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}]: " "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}")
     fi
@@ -1564,8 +1586,8 @@ EOF
     # --values path is the temp secrets file, so no credentials are echoed. (Args are
     # space-joined for display; copy-paste needs quoting if a values path has spaces.)
     if [[ -n "$DRY_RUN" ]]; then
-        echo "[dry-run] would run: helm ${helm_args[*]} --dry-run" >&2
-        echo "[dry-run] collector not installed; no changes made." >&2
+        echo "${C_BOLD}${C_BLUE}[dry-run]${C_RESET} would run: helm ${helm_args[*]} --dry-run" >&2
+        echo "${C_BOLD}${C_BLUE}[dry-run]${C_RESET} collector not installed; no changes made." >&2
         return 0
     fi
 
@@ -1587,8 +1609,8 @@ EOF
     # Success: surface concrete next steps (label/name reflect fullnameOverride=sumo).
     cat <<EOF
 
-Sumo collector installed — chart ${chart_version}, cluster '${CLUSTER_NAME}'.
-Next steps:
+${C_BOLD}${C_GREEN}Sumo collector installed — chart ${chart_version}, cluster '${CLUSTER_NAME}'.${C_RESET}
+${C_BOLD}Next steps:${C_RESET}
   Watch pods:           kubectl get pods -n sumologic -w
   Tail collector logs:  kubectl logs -n sumologic -l app.kubernetes.io/name=sumo-otelcol-logs-collector -f
   Health check:         $0 -s
@@ -1823,7 +1845,7 @@ function version {
 # "not found" rather than tripping errexit / the ERR trap), and missing tools are
 # reported rather than fatal.
 function status {
-    echo "== sumo-otel-local status =="
+    echo "${C_BOLD}${C_MAGENTA}== sumo-otel-local status ==${C_RESET}"
 
     # Container runtime + KinD provider.
     if select_runtime; then
@@ -1897,9 +1919,24 @@ function on_error {
     local exit_code=$?
     local line_no=${1:-unknown}
     echo "" >&2
-    echo "Error: command failed (exit ${exit_code}) at line ${line_no}." >&2
+    echo "${C_BOLD}${C_RED}Error: command failed (exit ${exit_code}) at line ${line_no}.${C_RESET}" >&2
     echo "Nothing has been changed or removed. To tear down a cluster, re-run with -u/--uninstall or -p/--purge." >&2
     exit "${exit_code}"
+}
+
+# Print an ASCII banner on launch. Stderr-only and TTY-gated (like colours), so it never
+# pollutes captured stdout or non-interactive/CI output. Purely cosmetic.
+function banner {
+    [[ -t 2 ]] || return 0
+    printf '%s\n' "${C_BOLD}${C_MAGENTA}" >&2
+    cat >&2 <<'EOF'
+   ___                    ___ _____ ___ _
+  / __|_  _ _ __  ___    / _ \_   _| __| |
+  \__ \ || | '  \/ _ \  | (_) || | | _|| |__
+  |___/\_,_|_|_|_\___/   \___/ |_| |___|____|
+EOF
+    printf '%s  local KinD cluster + Sumo Logic OpenTelemetry collector  ·  v%s%s\n\n' \
+        "${C_RESET}${C_DIM}" "${VERSION}" "${C_RESET}" >&2
 }
 
 # Record the CLI action chosen during parsing. Repeating the same action is idempotent;
@@ -1989,7 +2026,7 @@ function write_config_from_template {
     # A per-user config that may end up holding credentials should not be world-readable;
     # match the chmod-600 convention used for the temp values file.
     chmod 600 "$SUMO_CONFIG_FILE" 2>/dev/null || true
-    echo "Created ${SUMO_CONFIG_FILE} from the template." >&2
+    echo "${C_BOLD}${C_GREEN}Created ${SUMO_CONFIG_FILE} from the template.${C_RESET}" >&2
     echo "Edit it (e.g. uncomment 'SUMOLOGIC_ENDPOINT=us2'), then re-run to apply." >&2
 }
 
@@ -2093,6 +2130,10 @@ function main {
         esac
         shift
     done
+
+    # Cosmetic launch banner (stderr, TTY-only). Skipped for -v/--version so its stdout stays
+    # a clean, parseable version string.
+    [[ "$action" != "version" ]] && banner
 
     # -h/--help always wins: print usage and exit cleanly, before any error.
     if [[ -n "$show_help" ]]; then

@@ -537,6 +537,68 @@ setup() {
     assert_called "^podman exec sumo-worker systemctl restart containerd"
 }
 
+@test "init_cluster: STRIP_DNS_SEARCH_DOMAINS set triggers strip_dns_search_domains after a fresh create" {
+    run bash -c 'source "$1"; trap - ERR EXIT
+        select_runtime(){ CONTAINER_RUNTIME=docker; return 0; }
+        set_kind_provider(){ :; }; ensure_docker_ready(){ :; }
+        cluster_exists(){ return 1; }
+        kind(){ echo "kind $*"; }
+        docker(){ echo "docker $*"; }
+        STRIP_DNS_SEARCH_DOMAINS="corp.example.com"
+        ASSUME_YES=yes; init_cluster' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Stripping DNS search suffix(es) [corp.example.com] from cluster 'sumo'"* ]]
+}
+
+# --- strip_dns_search_domains (corporate DNS search-suffix collision) -------
+
+@test "strip_dns_search_domains: no-op (no kind/runtime calls) when STRIP_DNS_SEARCH_DOMAINS is unset" {
+    CONTAINER_RUNTIME=podman
+    STRIP_DNS_SEARCH_DOMAINS=""
+    run strip_dns_search_domains sumo
+    [ "$status" -eq 0 ]
+    [ ! -s "$CALLS" ]
+}
+
+@test "strip_dns_search_domains: execs into every node with the suffix list" {
+    kind() { printf 'sumo-control-plane\nsumo-worker\n'; } # override setup()'s CALLS-logging stub
+    CONTAINER_RUNTIME=podman
+    STRIP_DNS_SEARCH_DOMAINS="sumologic.com:sumologic.net"
+    run strip_dns_search_domains sumo
+    [ "$status" -eq 0 ]
+    assert_called "^podman exec sumo-control-plane sh -c"
+    assert_called "^podman exec sumo-worker sh -c"
+    assert_called "sh sumologic.com sumologic.net\$"
+}
+
+@test "strip_dns_search_domains: actually rewrites a resolv.conf's search line correctly" {
+    local resolv="${BATS_TEST_TMPDIR}/resolv.conf"
+    printf 'search dns.podman sumologic.com sumologic.net\nnameserver 10.89.0.1\n' >"$resolv"
+    # Run the exact script strip_dns_search_domains execs into a node, against a
+    # real file, to prove the awk logic itself is correct (not just that it's
+    # invoked) -- bypassing kind/podman entirely since this only needs a shell.
+    run bash -c '
+        strip="$1"
+        awk -v strip="$strip" "
+            BEGIN { n = split(strip, arr, \" \"); for (i = 1; i <= n; i++) bad[arr[i]] = 1 }
+            /^search / {
+                out = \"search\"
+                for (i = 2; i <= NF; i++) if (!(\$i in bad)) out = out \" \" \$i
+                print out
+                next
+            }
+            { print }
+        " "$2" >"$2.stripped" &&
+        cat "$2.stripped" >"$2" &&
+        rm -f "$2.stripped"
+    ' sh "sumologic.com sumologic.net" "$resolv"
+    [ "$status" -eq 0 ]
+    run cat "$resolv"
+    [[ "$output" == *"search dns.podman"* ]]
+    [[ "$output" != *"sumologic"* ]]
+    [[ "$output" == *"nameserver 10.89.0.1"* ]]
+}
+
 @test "uninstall --verbose echoes the kind delete before running it" {
     run bash -c 'source "$1"; require_cmd(){ :;}; select_runtime(){ CONTAINER_RUNTIME=docker; return 0; }; set_kind_provider(){ :; }
         kind(){ echo KIND_RAN; }; VERBOSE=yes; FORCE=yes; uninstall' _ "$SCRIPT"

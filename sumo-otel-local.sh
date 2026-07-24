@@ -138,6 +138,16 @@ fi
 # the interactive prompt (e.g. CONTAINER_RUNTIME=docker); select_runtime fills it in.
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
 
+# Extra CA certificates to trust inside every KinD node — for networks with a TLS-
+# inspecting proxy (Netskope, Zscaler, etc.) that re-signs outbound HTTPS with an
+# internal CA. The host trusts that CA (it's in the OS/system trust store), but a
+# freshly created KinD node is a separate, minimal container and does NOT inherit
+# it, so every image pull inside the cluster fails with "x509: certificate signed
+# by unknown authority" even though `curl`/`docker pull` on the host work fine.
+# Opt-in, colon-separated PEM file paths; empty by default, so nobody outside an
+# intercepted network pays for this. See inject_extra_ca_certs.
+EXTRA_CA_CERTS="${EXTRA_CA_CERTS:-}"
+
 # Helm repository for the Sumo Logic collection.
 SUMO_HELM_REPO_URL="https://sumologic.github.io/sumologic-kubernetes-collection"
 
@@ -1091,6 +1101,38 @@ function cluster_exists {
     kind get clusters 2>/dev/null | grep -Fxq "$1"
 }
 
+# Trust each cert in EXTRA_CA_CERTS (colon-separated PEM paths) inside every node of
+# $1's cluster, then restart containerd so image pulls pick up the new trust
+# immediately. No-op when EXTRA_CA_CERTS is unset (the default) — this only runs at
+# all for operators who opted in. Node containers are minimal and do NOT inherit the
+# host's trust store, so a working `curl`/`docker pull` on the host doesn't mean
+# pulls inside the node will succeed.
+function inject_extra_ca_certs {
+    local cluster_name=$1
+    [[ -z "$EXTRA_CA_CERTS" ]] && return 0
+
+    local cert node base
+    local -a certs
+    IFS=':' read -ra certs <<<"$EXTRA_CA_CERTS"
+
+    for cert in "${certs[@]}"; do
+        if [[ ! -f "$cert" || ! -r "$cert" ]]; then
+            echo "Error: EXTRA_CA_CERTS entry not found or unreadable: '${cert}'" >&2
+            exit 1
+        fi
+    done
+
+    echo "Trusting ${#certs[@]} extra CA cert(s) inside cluster '${cluster_name}'..." >&2
+    for node in $(kind get nodes --name "$cluster_name"); do
+        for cert in "${certs[@]}"; do
+            base=$(basename "$cert")
+            run_cmd "$CONTAINER_RUNTIME" cp "$cert" "${node}:/usr/local/share/ca-certificates/${base}"
+        done
+        run_cmd "$CONTAINER_RUNTIME" exec "$node" update-ca-certificates
+        run_cmd "$CONTAINER_RUNTIME" exec "$node" systemctl restart containerd
+    done
+}
+
 function init_cluster {
     # --dry-run: preview the runtime prep + cluster create and touch nothing — no runtime
     # setup, no Podman machine, no `kind create`. (Shows the pinned-default create command.)
@@ -1133,6 +1175,7 @@ function init_cluster {
         case "$choice" in
             [Rr]*)
                 echo "Reusing existing cluster '${CLUSTER_NAME}'."
+                inject_extra_ca_certs "$CLUSTER_NAME"
                 return 0
                 ;;
             [Dd]*)
@@ -1167,6 +1210,8 @@ function init_cluster {
             run_cmd kind create cluster --name "${CLUSTER_NAME}" --config "$kind_config"
         fi
     fi
+
+    inject_extra_ca_certs "$CLUSTER_NAME"
 }
 
 # Fail early with a clear message if a Helm values file is missing or unreadable.
